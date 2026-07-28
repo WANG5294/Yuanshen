@@ -3,9 +3,9 @@ __pycache__/
 .env
 .venv/
 venv/
-files/
-file/*
-!file/.gitkeep
+.history
 backups/
 *.log
 .DS_Store
+project/*
+!project/.gitkeep

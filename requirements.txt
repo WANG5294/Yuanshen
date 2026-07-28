@@ -5,3 +5,4 @@ numpy>=1.26
 mpremote>=1.20
 prompt-toolkit>=3.0
 openai>=1.0
+rich>=13.0

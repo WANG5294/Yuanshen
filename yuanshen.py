@@ -48,14 +48,73 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from rich.table import Table
+from rich.markdown import Markdown
+from rich.markup import escape as rich_escape
+from rich.status import Status
+from rich.columns import Columns
+
+console = Console()
+
 try:
-    from prompt_toolkit import prompt as terminal_prompt
+    from prompt_toolkit import PromptSession, prompt as terminal_prompt
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.completion import WordCompleter
+    _HAS_PT = True
 except ImportError:
+    PromptSession = None
     terminal_prompt = None
+    _HAS_PT = False
+
+
+SLASH_COMMANDS_WORDS = ["/tool", "/skill", "/work", "/wiring", "/audio",
+                  "/model", "/doc", "/api-key", "/help", "/exit",
+                  "/rounds", "/new", "/history"]
+
+SLASH_COMMANDS_META = {
+    "/tool": "📦 查看本地和 MCP 工具列表",
+    "/skill": "🧠 查看可用技能知识库",
+    "/work": "🔍 探测当前环境能力",
+    "/wiring": "🔌 查看当前接线文档",
+    "/audio": "🎤 开关音频验证模式",
+    "/model": "🤖 切换大语言模型",
+    "/doc": "📄 导入硬件说明文档为技能",
+    "/api-key": "🔑 查看/更新 API Key",
+    "/new": "📁 创建新 ESP32 项目",
+    "/history": "📖 浏览历史项目",
+    "/help": "❓ 显示帮助",
+    "/exit": "🚪 退出程序",
+    "/rounds": "🔄 显示轮次信息",
+}
+
+_session = None
+
+
+def _model_names() -> list:
+    """返回当前注册的模型别名列表（延迟获取）。"""
+    return list(MODEL_REGISTRY.keys())
 
 
 def read_input(message: str) -> str:
-    """读取一行终端输入；优先使用支持中文宽字符正确重绘的行编辑器。"""
+    """读取一行终端输入；优先使用 prompt_toolkit 增强版。
+    支持 slash 命令补全、历史记录（.history 文件）。"""
+    global _session
+    if _HAS_PT and sys.stdin.isatty() and sys.stdout.isatty():
+        if _session is None:
+            _session = PromptSession(
+                history=FileHistory(str(SCRIPT_DIR / ".history")),
+                completer=WordCompleter(
+                    SLASH_COMMANDS_WORDS,
+                    meta_dict=SLASH_COMMANDS_META,
+                ),
+            )
+        try:
+            return _session.prompt(message)
+        except (EOFError, KeyboardInterrupt):
+            raise
     if terminal_prompt is not None and sys.stdin.isatty() and sys.stdout.isatty():
         return terminal_prompt(message)
     return input(message)
@@ -104,7 +163,8 @@ for _k in ("ALL_PROXY", "all_proxy"):
 WORKDIR = Path.cwd()
 SKILLS_DIR = SCRIPT_DIR / "skills"
 FILES_DIR = SCRIPT_DIR / "file"         # v4：每个任务保存逐轮完整快照与最终产物
-WIRING_FILE = SCRIPT_DIR / "wiring.md"  # 当前接线事实，常驻 system prompt
+PROJECTS_DIR = SCRIPT_DIR / "project"   # 项目目录（/new 创建的项目在此）
+WIRING_FILE = SCRIPT_DIR / "wiring.md"  # 当前接线事实（可被项目切换）
 ESP32_REFERENCE_FILE = (
     SCRIPT_DIR / "docs/reference/修正ESP32_D0WD_硬件开发手册.md"
 )
@@ -117,8 +177,13 @@ if AUDIO_VALIDATION_MODE not in ("auto", "required", "off"):
 
 
 def read_wiring() -> str:
+    wiring_file = WIRING_FILE
+    if CURRENT_TASK_DIR is not None:
+        project_wiring = CURRENT_TASK_DIR / "wiring.md"
+        if project_wiring.exists():
+            wiring_file = project_wiring
     try:
-        return WIRING_FILE.read_text().strip()
+        return wiring_file.read_text().strip()
     except OSError:
         return "（wiring.md 不存在——接线情况未知，涉及外接硬件时先向用户确认）"
 
@@ -250,6 +315,27 @@ def load_api_key() -> bool:
     API_KEY = os.getenv(cfg["api_key_env"])
     _clients = {}  # 切换模型/Key 后重建客户端
     return True
+
+
+def _save_api_key(env_name: str, key_value: str) -> None:
+    """保存 API Key 到 .env 文件（覆盖或追加）。"""
+    env_path = SCRIPT_DIR / ".env"
+    lines = []
+    found = False
+    if env_path.exists():
+        lines = env_path.read_text().splitlines()
+    new_lines = []
+    for line in lines:
+        if line.startswith(f"{env_name}="):
+            new_lines.append(f"{env_name}={key_value}")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"{env_name}={key_value}")
+    env_path.write_text("\n".join(new_lines) + "\n")
+    console.print(f"[dim]已保存到 {env_path}[/dim]")
+    load_dotenv(SCRIPT_DIR / ".env", override=True)
 
 
 def _get_anthropic_client(cfg: dict):
@@ -414,10 +500,16 @@ def normalize_task_input(user_input: str, current_wiring: str,
 
 
 def write_wiring(wiring: str):
-    """确认后原子替换 wiring.md，避免写入中断留下半份接线。"""
-    tmp = WIRING_FILE.with_name(WIRING_FILE.name + ".tmp")
+    """确认后原子替换 wiring.md（优先项目目录）。"""
+    wiring_file = WIRING_FILE
+    if CURRENT_TASK_DIR is not None:
+        project_wiring = CURRENT_TASK_DIR / "wiring.md"
+        # 总是写入项目目录（不存在则创建）
+        project_wiring.parent.mkdir(parents=True, exist_ok=True)
+        wiring_file = project_wiring
+    tmp = wiring_file.with_name(wiring_file.name + ".tmp")
     tmp.write_text(wiring.rstrip() + "\n")
-    tmp.replace(WIRING_FILE)
+    tmp.replace(wiring_file)
 
 
 def confirm_normalized_task(user_input: str) -> tuple[str, str, bool] | None:
@@ -436,15 +528,14 @@ def confirm_normalized_task(user_input: str) -> tuple[str, str, bool] | None:
                 feedback=feedback,
             )
         except Exception as e:
-            print(f"❌ 需求与接线规范化失败：{e}")
-            print("本次任务未进入 Agent 循环，wiring.md 未修改。")
+            console.print(f"[red]❌ 需求与接线规范化失败：{e}[/red]")
+            console.print("[dim]本次任务未进入 Agent 循环，wiring.md 未修改。[/dim]")
             return None
 
-        print("\n========== 待确认：规范化需求 ==========")
-        print(requirement)
-        print("\n========== 待确认：规范化接线 ==========")
-        print(wiring)
-        print("========================================")
+        console.print(Panel(requirement, title="📋 待确认：规范化需求",
+                            border_style="cyan"))
+        console.print(Panel(wiring, title="🔌 待确认：规范化接线",
+                            border_style="green"))
         try:
             answer = read_input(
                 "确认以上内容？[y=确认并启动 / 输入修改意见=重新优化 / "
@@ -456,16 +547,16 @@ def confirm_normalized_task(user_input: str) -> tuple[str, str, bool] | None:
             try:
                 write_wiring(wiring)
             except OSError as e:
-                print(f"❌ wiring.md 写入失败：{e}")
-                print("本次任务未进入 Agent 循环。")
+                console.print(f"[red]❌ wiring.md 写入失败：{e}[/red]")
+                console.print("[dim]本次任务未进入 Agent 循环。[/dim]")
                 return None
-            print(f"✅ 已确认并更新 {WIRING_FILE.name}，即将以规范化需求启动 Agent。")
+            console.print(f"[green]✅ 已确认并更新 {WIRING_FILE.name}，即将以规范化需求启动 Agent。[/green]")
             return requirement, wiring, audio_required
         if answer.lower() in ("n", "no", "否", "取消", "cancel"):
-            print("已取消。本次任务未进入 Agent 循环，wiring.md 未修改。")
+            console.print("[yellow]已取消。本次任务未进入 Agent 循环，wiring.md 未修改。[/yellow]")
             return None
         if not answer:
-            print("未收到确认。请输入 y、n，或直接输入具体修改意见。")
+            console.print("[yellow]未收到确认。请输入 y、n，或直接输入具体修改意见。[/yellow]")
             feedback = "用户未确认，请保持上一版内容并再次完整输出。"
         else:
             feedback = answer
@@ -604,9 +695,9 @@ def init_mcp():
                     "description": t.get("description", ""),
                     "input_schema": t.get("inputSchema",
                                           {"type": "object", "properties": {}})})
-            print(f"MCP 服务器 {cfg['name']}: 注册 {len(tools)} 个工具（含麦克风闭环）")
+            console.print(f"[green]MCP 服务器 {cfg['name']}: 注册 {len(tools)} 个工具（含麦克风闭环）[/green]")
         except Exception as e:
-            print(f"⚠ MCP 服务器 {cfg['name']} 启动失败: {e}（其工具不可用）")
+            console.print(f"[yellow]⚠ MCP 服务器 {cfg['name']} 启动失败: {e}（其工具不可用）[/yellow]")
 
 
 # =============================================================================
@@ -1256,9 +1347,18 @@ def _round_purpose(text: str, tool_names: str) -> str:
 
 
 def _round_status_line(round_no: int, elapsed: int, tool_names: str,
-                       purpose: str, status: str) -> str:
-    return (f"第 {round_no} 轮｜第 {elapsed} 秒｜工具：{tool_names}｜"
-            f"目的和作用：{purpose} …… {status}")
+                       purpose: str, status: str) -> Text:
+    """生成带颜色的 Rich Text 状态行。"""
+    text = Text()
+    text.append(f"第 {round_no} 轮 ", style="bold cyan")
+    text.append(f"({elapsed}s) ", style="dim white")
+    text.append(f"[{tool_names}] ", style="yellow")
+    text.append(f"{purpose} ", style="white")
+    style_map = {"成功": "bold green", "失败": "bold red",
+                 "跳过": "bold yellow", "执行中": "bold blue"}
+    color = style_map.get(status, "white")
+    text.append(f"● {status}", style=color)
+    return text
 
 
 def _tool_outcome(output: str) -> str:
@@ -1273,17 +1373,77 @@ def _show_round_start(round_no: int, elapsed: int, tool_names: str,
                       purpose: str) -> bool:
     """TTY 中保留当前行以便改写；日志/管道模式输出独立的执行中记录。"""
     tty = sys.stdout.isatty()
-    line = _round_status_line(
+    text = _round_status_line(
         round_no, elapsed, tool_names, purpose, "执行中"
     )
-    print(line, end="" if tty else "\n", flush=True)
+    if tty:
+        console.print(text, end="")
+    else:
+        print(text.plain, end="\n")
+    sys.stdout.flush()
     return tty
 
 
 def _show_round_result(round_no: int, elapsed: int, tool_names: str,
                        purpose: str, status: str, rewrite: bool) -> None:
-    line = _round_status_line(round_no, elapsed, tool_names, purpose, status)
-    print(("\r\033[2K" if rewrite else "") + line, flush=True)
+    text = _round_status_line(round_no, elapsed, tool_names, purpose, status)
+    if rewrite and sys.stdout.isatty():
+        # Rich 模式：清行后打印
+        console.print("\r" + " " * console.width + "\r", end="")
+        console.print(text)
+    else:
+        console.print(text)
+    sys.stdout.flush()
+
+
+def _animate_markdown(text: str) -> None:
+    """打字机效果：按自然段分割，节奏更自然。
+    短文本直接渲染，长文本逐段增量出现。"""
+    from rich.live import Live
+
+    if not text.strip():
+        return
+    if not sys.stdout.isatty():
+        print(text)
+        return
+
+    # 按标点/换行分割成自然段
+    import re
+    segments = re.split(r"(?<=[。！？\n!?])", text)
+    segments = [s for s in segments if s.strip()]
+
+    # 短文本直接显示
+    if len(segments) <= 2 and len(text) < 100:
+        console.print(Markdown(text))
+        return
+
+    accumulated = ""
+    try:
+        with Live(Markdown(""), refresh_per_second=20,
+                  vertical_overflow="visible") as live:
+            for seg in segments:
+                accumulated += seg
+                live.update(Markdown(accumulated))
+                # 短段加快，长段放慢
+                delay = min(0.08, max(0.02, len(seg) * 0.002))
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        # Ctrl+C：直接打印剩余文本
+        console.print(Markdown(text))
+
+
+def _render_assistant_text(text: str) -> None:
+    """渲染助手文本：短文本直接显示，长文本用打字机效果。"""
+    text = text.strip()
+    if not text:
+        return
+    if not sys.stdout.isatty():
+        print(text)
+        return
+    if text.count("\n") < 3 and len(text) < 200:
+        console.print(Markdown(text))
+    else:
+        _animate_markdown(text)
 
 
 def write_round_snapshot(call_no: int, elapsed: int, system: str, tools: list,
@@ -1376,7 +1536,7 @@ def agent_loop(messages: list, run_log: dict, task_start: float):
             )
             for block in response.content:
                 if getattr(block, "type", None) == "text" and block.text.strip():
-                    print(block.text)
+                    _render_assistant_text(block.text)
             messages.append({"role": "assistant", "content": response.content})
             run_log["final_text"] = _text_of(response)
             run_log["elapsed"] = elapsed
@@ -1387,6 +1547,14 @@ def agent_loop(messages: list, run_log: dict, task_start: float):
             return
 
         text = _text_of(response).strip()
+
+        # 工具轮次的思考过程用灰色显示
+        if text and sys.stdout.isatty():
+            lines = text.split("\n")
+            short_text = "\n".join(lines[:6])  # 最多显示6行
+            if len(lines) > 6:
+                short_text += "\n[dim]…（思考中）[/dim]"
+            console.print(f"[dim]{short_text}[/dim]")
 
         round_no += 1
         tool_calls = [b for b in response.content if b.type == "tool_use"]
@@ -1404,7 +1572,7 @@ def agent_loop(messages: list, run_log: dict, task_start: float):
                                 messages=messages, max_tokens=4000)
             for block in report.content:
                 if getattr(block, "type", None) == "text":
-                    print(block.text)
+                    _render_assistant_text(block.text)
             messages.append({"role": "assistant", "content": report.content})
             run_log["final_text"] = _text_of(report)
             run_log["elapsed"] = int(time.monotonic() - task_start)
@@ -1667,32 +1835,51 @@ def archive_run(user_input: str, task_dir: Path, messages: list,
 
 
 def cmd_tool():
-    print("== 本地工具 ==")
+    table = Table(title="可用工具", border_style="dim")
+    table.add_column("类型", style="cyan", no_wrap=True)
+    table.add_column("名称", style="green")
+    table.add_column("描述")
+
     for t in base_tools():
-        print(f"  - [本地] {t['name']}: {t['description'].splitlines()[0]}")
-    print("== MCP 工具 (esp32-piano 服务器) ==")
-    if not MCP_TOOL_DEFS:
-        print("  (无 —— MCP 服务器未启动)")
-    for t in MCP_TOOL_DEFS:
-        desc = t["description"].strip().splitlines()
-        print(f"  - [MCP] {t['name']}: {desc[0] if desc else '(无描述)'}")
+        table.add_row("本地", t["name"], t["description"].splitlines()[0])
+
+    if MCP_TOOL_DEFS:
+        for t in MCP_TOOL_DEFS:
+            desc = t["description"].strip().splitlines()
+            table.add_row("MCP", t["name"], desc[0] if desc else "(无描述)")
+    else:
+        table.add_row("MCP", "(无)", "MCP 服务器未启动")
+
+    console.print(table)
 
 
 def cmd_skill():
-    print("== 可用技能（Skill 工具按需加载；exp- 开头为自动提取的经验）==")
+    table = Table(title="可用技能（exp- 开头为自动提取的经验）", border_style="dim")
+    table.add_column("名称", style="cyan")
+    table.add_column("描述")
     if not SKILLS.skills:
-        print("  (无)")
+        table.add_row("(无)", "")
     for n, s in SKILLS.skills.items():
-        print(f"  - {n}: {s['description']}")
+        table.add_row(n, s["description"])
+    console.print(table)
 
 
 def cmd_work():
-    print("== 当前环境能力探测 ==")
     import glob
     ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
-    print(f"  串口设备: {'✓ ' + ', '.join(ports) if ports else '✗ 未发现（检查USB线/dialout权限）'}")
+
+    table = Table(title="当前环境能力探测", border_style="dim")
+    table.add_column("项目", style="cyan", no_wrap=True)
+    table.add_column("状态")
+
+    port_status = (f"[green]✓[/green] {', '.join(ports)}"
+                   if ports else "[red]✗[/red] 未发现（检查USB线/dialout权限）")
+    table.add_row("串口设备", port_status)
+
     mp = shutil.which("mpremote")
-    print(f"  mpremote: {'✓ ' + mp if mp else '✗ 未安装（pip install mpremote）'}")
+    mp_status = f"[green]✓[/green] {mp}" if mp else "[red]✗[/red] 未安装"
+    table.add_row("mpremote", mp_status)
+
     board = False
     if ports and mp:
         try:
@@ -1701,32 +1888,42 @@ def cmd_work():
             board = "pong" in r.stdout
         except Exception:
             pass
-    print(f"  板子 REPL 响应: {'✓ 可交互' if board else '✗ 无响应（板子未接/被程序占用）'}")
-    print(f"  上传/运行/删除板上文件: {'✓ 可用' if board else '✗ 依赖上面三项'}")
-    mic = "✗ 探测失败"
+    board_status = ("[green]✓[/green] 可交互"
+                    if board else "[red]✗[/red] 无响应（板子未接/被程序占用）")
+    table.add_row("板子 REPL 响应", board_status)
+    table.add_row("上传/运行/删除", ("[green]✓[/green] 可用"
+                                   if board else "[red]✗[/red] 依赖上面三项"))
+
+    mic = "[red]✗[/red] 探测失败"
     if "mic_check" in MCP_CLIENTS:
         try:
             out = MCP_CLIENTS["mic_check"].call_tool("mic_check", {})
-            mic = ("✓ " + out.splitlines()[0]) if out.startswith("麦克风正常") \
-                else "✗ 录到全零（VirtualBox 设备→音频→勾选音频输入）"
+            mic = (("[green]✓[/green] " + out.splitlines()[0])
+                   if out.startswith("麦克风正常")
+                   else "[red]✗[/red] 录到全零（VirtualBox 设备→音频→勾选音频输入）")
         except Exception as e:
-            mic = f"✗ {e}"
+            mic = f"[red]✗[/red] {rich_escape(str(e))}"
     else:
-        mic = "✗ MCP 工具未注册"
-    print(f"  麦克风闭环: {mic}")
-    print(f"  音频验收模式: {AUDIO_VALIDATION_MODE}")
-    print(f"  技能知识库: {'✓ ' + str(len(SKILLS.skills)) + ' 个分块' if SKILLS.skills else '✗ 无'}")
-    print(f"  任务文件夹: ✓ {FILES_DIR}（每任务仅保留最终代码和完整 user prompt）")
+        mic = "[red]✗[/red] MCP 工具未注册"
+    table.add_row("麦克风闭环", mic)
+    table.add_row("音频验收模式", AUDIO_VALIDATION_MODE)
+    table.add_row("技能知识库", (f"[green]✓[/green] {len(SKILLS.skills)} 个分块"
+                                if SKILLS.skills else "[red]✗[/red] 无"))
+
     cfg = current_model_config()
-    print(f"  大模型 API: {'✓ ' + current_model_alias() if has_key() else '✗ 缺 ' + cfg['api_key_env'] + '（见 .env.example）'}")
-    print("  固件烧录 (esptool/erase_flash): ✗ 安全红线，永久禁止")
+    api_status = (f"[green]✓[/green] {current_model_alias()}"
+                  if has_key() else f"[red]✗[/red] 缺 {cfg['api_key_env']}（见 .env.example）")
+    table.add_row("大模型 API", api_status)
+    table.add_row("固件烧录", "[red]✗[/red] 安全红线，永久禁止")
+
+    console.print(table)
 
 
 def cmd_wiring():
-    print(f"== 当前接线（{WIRING_FILE}）==")
-    print(read_wiring())
-    print("普通任务开始前会同时规范化需求与本文件，并在你确认后覆盖更新；"
-          "也可直接编辑该文件，下一次规范化会读取最新内容。")
+    console.print(Panel(read_wiring(), title=f"当前接线（{WIRING_FILE}）",
+                        border_style="green"))
+    console.print("[dim]普通任务开始前会同时规范化需求与本文件，并在你确认后覆盖更新；"
+                  "也可直接编辑该文件，下一次规范化会读取最新内容。[/dim]")
 
 
 def cmd_audio(arg: str = ""):
@@ -1741,7 +1938,7 @@ def cmd_audio(arg: str = ""):
                 "请选择 [on=开 / off=关 / required=严格]: "
             ).strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("未修改音频验证模式。")
+            console.print("[dim]未修改音频验证模式。[/dim]")
             return
     aliases = {
         "on": "auto", "开": "auto", "开启": "auto", "auto": "auto",
@@ -1750,13 +1947,13 @@ def cmd_audio(arg: str = ""):
     }
     mode = aliases.get(choice)
     if mode is None:
-        print("用法：/audio [on|off|required]")
+        console.print("[yellow]用法：/audio [on|off|required][/yellow]")
         return
     AUDIO_VALIDATION_MODE = mode
     labels = {"auto": "已开启（失败时降级，不阻塞主任务）",
               "off": "已关闭（跳过麦克风工具）",
               "required": "严格模式（音频失败会阻塞任务）"}
-    print(f"✅ 音频验证{labels[mode]}。本设置仅对当前运行会话生效。")
+    console.print(f"[green]✅ 音频验证{labels[mode]}。本设置仅对当前运行会话生效。[/green]")
 
 
 def cmd_doc(arg: str):
@@ -1764,59 +1961,213 @@ def cmd_doc(arg: str):
     frontmatter 含 name（kebab-case）与 description（何时加载）。"""
     path = Path(arg.strip()).expanduser()
     if not arg.strip():
-        print("用法：/doc <硬件说明md路径>\n"
-              "文档格式要求（缺一不可）：\n"
-              "  ---\n  name: 短横线小写英文名\n"
-              "  description: 一句话说明什么任务该加载本技能\n"
-              "  ---\n  正文（Markdown）")
+        console.print("[yellow]用法：/doc <硬件说明md路径>[/yellow]\n"
+                      "文档格式要求（缺一不可）：\n"
+                      "  ---\n  name: 短横线小写英文名\n"
+                      "  description: 一句话说明什么任务该加载本技能\n"
+                      "  ---\n  正文（Markdown）")
         return
     if not path.exists():
-        print(f"文件不存在: {path}")
+        console.print(f"[red]文件不存在: {path}[/red]")
         return
     parsed = SKILLS.parse(path)
     if parsed is None:
-        print(f"格式不合规：{path.name} 缺少 frontmatter 或 name/description。\n"
-              "要求开头为：\n  ---\n  name: xxx\n  description: xxx\n  ---")
+        console.print(f"[red]格式不合规：{path.name} 缺少 frontmatter 或 name/description。[/red]\n"
+                      "要求开头为：\n  ---\n  name: xxx\n  description: xxx\n  ---")
         return
     name = parsed["name"]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,40}", name):
-        print(f"name 不合规：'{name}'（需小写字母/数字/短横线）")
+        console.print(f"[red]name 不合规：'{name}'（需小写字母/数字/短横线）[/red]")
         return
     dest = SKILLS_DIR / name / "SKILL.md"
     if dest.exists():
-        print(f"技能 '{name}' 已存在，将覆盖更新。")
+        console.print(f"[yellow]技能 '{name}' 已存在，将覆盖更新。[/yellow]")
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(path, dest)
     SKILLS.reload()
-    print(f"✅ 已导入技能 '{name}'：{parsed['description']}\n"
-          f"   存放于 {dest}，立即生效（/skill 可查看）。")
+    console.print(f"[green]✅ 已导入技能 '{name}'：{parsed['description']}[/green]\n"
+                  f"   存放于 {dest}，立即生效（/skill 可查看）")
 
 
 def cmd_model(arg: str = ""):
     """查看或切换当前会话使用的大模型。"""
     arg = arg.strip()
     if not arg:
-        print("== 可用模型 ==")
+        table = Table(title="可用模型（Tab 补全选择）", border_style="dim")
+        table.add_column("状态", style="green", no_wrap=True)
+        table.add_column("别名", style="cyan")
+        table.add_column("提供者")
+        table.add_column("Base URL")
         for alias, cfg in MODEL_REGISTRY.items():
-            marker = "[*]" if alias == current_model_alias() else "[ ]"
-            print(f"  {marker} {alias}: {cfg['provider']} @ {cfg['base_url']}")
-        print(f"\n当前：{current_model_alias()}")
-        return
+            marker = "●" if alias == current_model_alias() else "○"
+            table.add_row(marker, alias, cfg["provider"], cfg["base_url"])
+        console.print(table)
+        console.print(f"[dim]当前：{current_model_alias()}[/dim]")
+        # 模型选择：临时切换 completer 以支持模型名 Tab 补全
+        alias = ""
+        if _session is not None:
+            try:
+                from prompt_toolkit.completion import WordCompleter
+                model_comp = WordCompleter(list(MODEL_REGISTRY.keys()))
+                old_comp = _session.completer
+                _session.completer = model_comp
+                try:
+                    alias = _session.prompt("选择模型（Tab 补全）: ").strip()
+                finally:
+                    _session.completer = old_comp
+            except (EOFError, KeyboardInterrupt):
+                return
+        if not alias:
+            try:
+                alias = read_input("选择模型: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+        if not alias:
+            return
+        arg = alias
     if switch_model(arg):
         if load_api_key():
             cfg = current_model_config()
             masked = API_KEY[:3] + "*" * 6 + API_KEY[-2:]
-            print(f"✅ 已切换为 {current_model_alias()} ({cfg['provider']}) @ {cfg['base_url']}（Key: {masked}）")
+            console.print(f"[green]✅ 已切换为 {current_model_alias()} ({cfg['provider']}) — Key: {masked}[/green]")
         else:
-            print(f"✅ 已切换为 {current_model_alias()}，但尚未配置对应 Key；请设置 {current_model_config()['api_key_env']}")
+            cfg = current_model_config()
+            console.print(f"[yellow]⚠ 模型 '{arg}' 缺少 {cfg['api_key_env']}[/yellow]")
+            try:
+                new_key = read_input(f"请输入 {cfg['api_key_env']}（直接回车取消）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if new_key:
+                _save_api_key(cfg['api_key_env'], new_key)
+                load_api_key()
+                masked = API_KEY[:3] + "*" * 6 + API_KEY[-2:]
+                console.print(f"[green]✅ Key 已保存，{arg} 可用。Key: {masked}[/green]")
     else:
         available = ", ".join(MODEL_REGISTRY)
-        print(f"❌ 未知模型 '{arg}'。可用：{available}")
+        console.print(f"[red]❌ 未知模型 '{rich_escape(arg)}'。可用：{available}[/red]")
+
+
+def cmd_exit():
+    """退出 Yuanshen。"""
+    console.print("[dim]👋 已退出 Yuanshen。[/dim]")
+    sys.exit(0)
+
+
+def slugify(text: str) -> str:
+    """将文本转为文件系统友好的短横线名。"""
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[-\s]+", "-", text)
+    return text[:30].strip("-").lower() or "project"
+
+
+def cmd_new_project(arg: str = ""):
+    """新建 ESP32 项目。"""
+    name = arg.strip()
+    if not name:
+        try:
+            name = read_input("📁 项目名称: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+    if not name:
+        console.print("[yellow]已取消[/yellow]")
+        return None
+
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    project_dir = PROJECTS_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{slugify(name)}"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "rounds").mkdir(exist_ok=True)
+    # 复制全局 wiring.md 到项目目录
+    if WIRING_FILE.exists():
+        shutil.copy2(WIRING_FILE, project_dir / "wiring.md")
+    else:
+        (project_dir / "wiring.md").write_text("（无接线）\n")
+
+    console.print(f"[green]✅ 项目 '{name}' 已创建[/green]")
+    console.print(f"[dim]   {project_dir.relative_to(SCRIPT_DIR)}[/dim]")
+    console.print("[cyan]请输入你的 ESP32 需求，Agent 会先输出接线文档，确认后开始实施。[/cyan]")
+    return project_dir
+
+
+def cmd_history():
+    """浏览历史项目。"""
+    projects = sorted(PROJECTS_DIR.iterdir()) if PROJECTS_DIR.exists() else []
+    if not projects:
+        console.print("[yellow]暂无历史项目。[/yellow]")
+        return
+
+    console.print("[bold]历史项目：[/bold]")
+    for i, p in enumerate(projects, 1):
+        req_file = p / "requirement.md"
+        req_preview = req_file.read_text().splitlines()[0][:60] if req_file.exists() else "(无需求)"
+        console.print(f"  [dim]{i}.[/dim] [cyan]{p.name}[/cyan] — {req_preview}")
+
+    try:
+        choice = read_input("选择项目编号（回车取消）: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    if choice.isdigit() and 1 <= int(choice) <= len(projects):
+        selected = projects[int(choice) - 1]
+        req_text = (selected / "requirement.md").read_text() if (
+            selected / "requirement.md").exists() else "（无记录）"
+        console.print(Panel(req_text, title=f"📖 {selected.name}", border_style="cyan"))
+    else:
+        console.print("[yellow]已取消[/yellow]")
+
+
+def handle_free_chat(user_input: str):
+    """自由对话模式：直接调用 LLM 回复，不启动项目流程。"""
+    console.print("[dim]自由对话模式 — 输入 /new 创建项目开始 ESP32 开发。[/dim]")
+    try:
+        response = llm_create(
+            model=current_model_alias(),
+            max_tokens=2000,
+            system="你是一个 ESP32 开发助手。用户处于自由对话模式。"
+                   "简短回答即可。如果需要开始项目，请提示用户使用 /new 命令。",
+            messages=[{"role": "user", "content": user_input}],
+        )
+        for block in response.content:
+            if getattr(block, "type", None) == "text" and block.text.strip():
+                if sys.stdout.isatty():
+                    _render_assistant_text(block.text)
+                else:
+                    print(block.text)
+    except Exception as e:
+        console.print(f"[red]❌ {e}[/red]")
+
+
+def cmd_api_key(arg: str = ""):
+    """查看或更新当前模型的 API Key。"""
+    arg = arg.strip()
+    cfg = current_model_config()
+    env_name = cfg["api_key_env"]
+
+    if arg:
+        _save_api_key(env_name, arg)
+        load_api_key()
+        masked = API_KEY[:3] + "*" * 6 + API_KEY[-2:]
+        console.print(f"[green]✅ {env_name} 已更新: {masked}[/green]")
+        return
+
+    current = API_KEY[:3] + "****" + API_KEY[-2:] if API_KEY else "（未设置）"
+    console.print(f"[dim]当前 {env_name}: {current}[/dim]")
+    try:
+        new_key = read_input(f"输入新的 {env_name}（直接回车取消）: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if new_key:
+        _save_api_key(env_name, new_key)
+        load_api_key()
+        masked = API_KEY[:3] + "*" * 6 + API_KEY[-2:]
+        console.print(f"[green]✅ {env_name} 已更新: {masked}[/green]")
+    else:
+        console.print("[yellow]已取消[/yellow]")
 
 
 COMMANDS = {"/tool": cmd_tool, "/skill": cmd_skill,
             "/work": cmd_work, "/wiring": cmd_wiring,
-            "/audio": cmd_audio, "/model": cmd_model}
+            "/audio": cmd_audio, "/model": cmd_model,
+            "/api-key": cmd_api_key, "/exit": cmd_exit}
 
 
 # =============================================================================
@@ -1824,32 +2175,50 @@ COMMANDS = {"/tool": cmd_tool, "/skill": cmd_skill,
 # =============================================================================
 
 
+BANNER_ART = r"""
+██╗░░░██╗██╗░░░░░██╗░░░░░░█████╗░███╗░░██╗░██████╗██╗░░██╗███████╗███╗░░██╗
+╚██╗░██╔╝██║░░░░░██║░░░░░██╔══██╗████╗░██║██╔════╝██║░░██║██╔════╝████╗░██║
+░╚████╔╝░██║░░░░░██║░░░░░███████║██╔██╗██║╚█████╗░███████║█████╗░░██╔██╗██║
+░░╚██╔╝░░██║░░░░░██║░░░░░██╔══██║██║╚████║░╚═══██╗██╔══██║██╔══╝░░██║╚████║
+░░░██║░░░███████╗███████╗██║░░██║██║░╚███║██████╔╝██║░░██║███████╗██║░╚███║
+░░░╚═╝░░░╚══════╝╚══════╝╚═╝░░╚═╝╚═╝░░╚══╝╚═════╝░╚═╝░░╚═╝╚══════╝╚═╝░░╚══╝
+"""
+
+
 def main():
-    print(f"Yuanshen v{APP_VERSION} —— ESP32 单片机 agent - {WORKDIR}")
-    if not load_api_key():
-        cfg = current_model_config()
-        print(f"（暂无可用 Key，仅斜杠命令可用；存好 {cfg['api_key_env']} 后重新运行生效）")
-    else:
+    has_key_loaded = load_api_key()
+    init_mcp()
+    
+    # ASCII art 启动画面
+    art = Text(BANNER_ART, style="cyan")
+    model_line = Text()
+    if has_key_loaded:
         cfg = current_model_config()
         masked = API_KEY[:3] + "*" * 6 + API_KEY[-2:]
-        print(f"模型: {current_model_alias()} ({cfg['provider']}) @ {cfg['base_url']}（Key: {masked}）")
-    print(f"技能: {', '.join(SKILLS.skills) or '无'}")
-    print(f"音频验收: {AUDIO_VALIDATION_MODE}")
-    init_mcp()
-    print("命令: /tool 看工具 | /work 看能力 | /model 切换模型 | "
-          "/audio 开关音频 | /skill 看技能 | /wiring 看接线 | "
-          "/doc <md> 导入硬件文档 | exit 退出\n")
+        model_line.append(f"模型: {current_model_alias()} ({cfg['provider']}) — Key: {masked}", style="bold yellow")
+    else:
+        cfg = current_model_config()
+        model_line.append(f"⚠ 暂无可用 Key（存好 {cfg['api_key_env']} 后重新运行）", style="yellow")
+    
+    console.print(Panel(
+        Text.assemble(art, "\n", model_line),
+        border_style="cyan",
+        subtitle=f"ESP32 MicroPython Agent v{APP_VERSION}",
+    ))
 
-    pending_context = None          # 用户选"继续对话修改"时的候选经验上下文
+    pending_context = None
+    current_project_dir = None           # 当前项目目录
     while True:
         try:
-            user_input = read_input("You: ").strip()
+            user_input = read_input("> ").strip()
         except (EOFError, KeyboardInterrupt):
             break
         if not user_input:
             continue
         if user_input.lower() in ("exit", "quit", "q"):
             break
+        
+        # --- 斜杠命令分发 ---
         if user_input in COMMANDS:
             COMMANDS[user_input]()
             print()
@@ -1866,63 +2235,82 @@ def main():
             cmd_doc(user_input[4:])
             print()
             continue
-        if user_input.startswith("/"):
-            print(f"未知命令 {user_input}。可用: "
-                  f"{', '.join(list(COMMANDS) + ['/audio on|off|required', '/model <alias>', '/doc <md路径>'])}\n")
-            continue
-        if not API_KEY:
-            print(key_guidance() + "\n")
-            continue
-
-        # 确认门禁：此处只进行无工具的规范化调用。用户确认前不创建
-        # Todo、任务目录、Agent 消息链，也不修改 wiring.md。
-        confirmed = confirm_normalized_task(user_input)
-        if confirmed is None:
+        if user_input == "/new" or user_input.startswith("/new "):
+            prefix = "/new"
+            arg = user_input[len(prefix):].strip()
+            proj = cmd_new_project(arg)
+            if proj:
+                current_project_dir = proj
             print()
             continue
-        # 用户确认完成即为本任务 0 秒；需求规范化和等待确认不计入任务耗时。
-        task_start = time.monotonic()
-        normalized_requirement, _normalized_wiring, audio_required = confirmed
+        if user_input == "/history":
+            cmd_history()
+            print()
+            continue
+        if user_input.startswith("/"):
+            console.print(f"[red]未知命令 {rich_escape(user_input)}[/red]。可用: "
+                          f"[yellow]{', '.join(list(COMMANDS) + ['/audio on|off|required', '/model <alias>', '/doc <md路径>', '/new 项目名', '/history'])}[/yellow]\n")
+            continue
+        if not API_KEY:
+            console.print(key_guidance() + "\n")
+            continue
 
-        content = normalized_requirement
-        if pending_context:         # 在原有记忆基础上继续多轮对话
-            content = (f"{pending_context}\n\n"
-                       f"【用户确认后的本轮规范化需求】{normalized_requirement}")
-            pending_context = None
-        TODO.start(normalized_requirement, audio_required)
-        global CURRENT_TASK_DIR
-        CURRENT_TASK_DIR = new_task_dir(normalized_requirement)
-        write_requirement(CURRENT_TASK_DIR, normalized_requirement)
-        # 每个任务使用独立、追加式消息链。首个 User 的固定前缀从此不再修改。
-        messages = [{
-            "role": "user",
-            "content": build_user_prompt(
-                content, round_no=1, elapsed=0,
-                previous_result="任务开始", previous_tools="无",
-            ),
-        }]
-        print(f"[任务文件夹] {CURRENT_TASK_DIR.relative_to(SCRIPT_DIR)}")
-        run_log = {"rounds": [], "prompt_input": content}
-        try:
-            agent_loop(messages, run_log, task_start)
-        except Exception as e:
-            print(f"Error: {e}")
-            run_log.setdefault("final_text", f"(异常中止: {e})")
-        print("\n⏳ 正在保存最终代码与完整 user prompt，并提取经验……")
-        try:
-            flow_md = render_flow_md(normalized_requirement, run_log)
-            run_dir = archive_run(
-                normalized_requirement, CURRENT_TASK_DIR, messages,
-                run_log.get("system_prompt", ""),
-            )
-            note, pending = extract_skill(flow_md, run_dir)
-            if pending:
-                pending_context = pending
-            print(f"[归档] {run_dir.relative_to(SCRIPT_DIR)} | {note}")
-            print("✅ 最终代码与完整 user prompt 已保存，可以继续提问或退出。")
-        except Exception as e:
-            print(f"[归档失败] {e}")
-        print()
+        # 用户输入回显（绿色）
+        console.print(f"[bold green]◉ {user_input}[/bold green]")
+
+        if current_project_dir:
+            # 项目模式：规范化 → 确认 → 实施（沿用原有流程）
+            confirmed = confirm_normalized_task(user_input)
+            if confirmed is None:
+                print()
+                continue
+            task_start = time.monotonic()
+            normalized_requirement, _normalized_wiring, audio_required = confirmed
+
+            content = normalized_requirement
+            if pending_context:
+                content = (f"{pending_context}\n\n"
+                           f"【用户确认后的本轮规范化需求】{normalized_requirement}")
+                pending_context = None
+            TODO.start(normalized_requirement, audio_required)
+            global CURRENT_TASK_DIR
+            CURRENT_TASK_DIR = current_project_dir
+            write_requirement(CURRENT_TASK_DIR, normalized_requirement)
+            messages = [{
+                "role": "user",
+                "content": build_user_prompt(
+                    content, round_no=1, elapsed=0,
+                    previous_result="任务开始", previous_tools="无",
+                ),
+            }]
+            console.print(f"[dim][项目实施][/dim] {CURRENT_TASK_DIR.relative_to(SCRIPT_DIR)}")
+            run_log = {"rounds": [], "prompt_input": content}
+            try:
+                agent_loop(messages, run_log, task_start)
+            except Exception as e:
+                console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
+                run_log.setdefault("final_text", f"(异常中止: {e})")
+            console.print("\n[dim]⏳ 正在保存最终代码与完整 user prompt，并提取经验…[/dim]")
+            try:
+                flow_md = render_flow_md(normalized_requirement, run_log)
+                run_dir = archive_run(
+                    normalized_requirement, CURRENT_TASK_DIR, messages,
+                    run_log.get("system_prompt", ""),
+                )
+                note, pending = extract_skill(flow_md, run_dir)
+                if pending:
+                    pending_context = pending
+                console.print(f"[归档] {run_dir.relative_to(SCRIPT_DIR)} | {note}")
+                console.print("✅ [green]最终代码与完整 user prompt 已保存，可以继续提问或退出。[/green]")
+            except Exception as e:
+                console.print(f"[red][归档失败][/red] {e}")
+            console.print("\n" + "━" * 50, style="orange1")
+            print()
+        else:
+            # 无项目：自由对话模式
+            handle_free_chat(user_input)
+            console.print("\n" + "━" * 50, style="orange1")
+            print()
 
 
 if __name__ == "__main__":
