@@ -1,7 +1,7 @@
 {
   "name": "yuanshen-esp32-agent",
-  "version": "1.0.0",
-  "description": "Yuanshen 1.0 正式版 —— ESP32 MicroPython 闭环开发 Agent",
+  "version": "1.1.0",
+  "description": "Yuanshen — ESP32 MicroPython 闭环开发 Agent，带现代化终端 UI",
   "bin": {
     "yuanshen": "bin/yuanshen.js"
   },
@@ -12,6 +12,7 @@
     "requirements.txt",
     "skills/",
     ".env.example",
+    "wiring.md",
     "docs/",
     "README.md"
   ],
