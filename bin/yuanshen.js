@@ -29,7 +29,7 @@ if (!fs.existsSync(venvPy)) {
 
 // 兼容包升级后新增 Python 依赖的情况，不要求用户手动重建已有虚拟环境。
 const depsReady = run(venvPy, ["-c",
-  "import anthropic, dotenv, mcp, numpy, prompt_toolkit"]).status === 0;
+  "import anthropic, dotenv, mcp, numpy, prompt_toolkit, openai"]).status === 0;
 if (!depsReady) {
   console.log("正在补齐或更新 Python 依赖…");
   if (run(venvPy, ["-m", "pip", "install", "-q", "-r",

@@ -83,16 +83,22 @@ sudo usermod -aG dialout $USER
 在项目根目录创建 `.env`（可复制 `.env.example`）：
 
 ```text
-DEEPSEEK_API_KEY=你的API_Key
-```
+# 默认模型：deepseek-v4-pro | deepseek-v4-flash | kimi-k3 | kimi-k2.7
+MODEL=deepseek-v4-pro
 
-可选配置：
+# DeepSeek 模型使用
+DEEPSEEK_API_KEY=你的DeepSeek_Key
 
-```text
+# Kimi 模型使用
+MOONSHOT_API_KEY=你的Moonshot_Key
+
+# 音频验收模式
 AUDIO_VALIDATION_MODE=auto   # auto | required | off
 ```
 
-运行中也可通过 `/audio` 命令切换，仅当前会话生效。
+- `MODEL` 决定启动时默认使用的模型；不同模型需要对应 Key。
+- 运行中可通过 `/model <alias>` 切换模型，仅当前会话生效。
+- 运行中可通过 `/audio` 切换音频验收模式，仅当前会话生效。
 
 ---
 
@@ -106,6 +112,8 @@ AUDIO_VALIDATION_MODE=auto   # auto | required | off
 | `/tool` | 查看本地工具与 MCP 工具列表 |
 | `/skill` | 查看已加载 Skill |
 | `/wiring` | 查看当前接线文档 |
+| `/model` | 列出可用模型及当前模型 |
+| `/model <alias>` | 切换当前会话使用的大模型 |
 | `/audio` | 交互切换音频验收模式 |
 | `/audio on\|off\|required` | 直接切换为 `auto` / `off` / `required` |
 | `/doc <md路径>` | 导入符合格式的硬件说明文档为 Skill |

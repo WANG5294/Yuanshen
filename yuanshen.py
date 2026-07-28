@@ -26,8 +26,8 @@ v4.0 将模型输入重构为“固定 System Prompt → 追加式 User/会话�
 
 继承 v2 的核心：agent 循环与循环摘要、主线任务 TodoWrite（烧录卡点+
 烧录卡点）、实机验证红线、file/ 每任务一个项目文件夹、经验提取需用户
-确认、/tool /skill /work。任务结束仅保存最终代码与完整 user prompt。模型固定为
-deepseek-v4-pro，不提供切换入口。
+确认、/tool /skill /work /model。任务结束仅保存最终代码与完整 user prompt。
+模型可通过 MODEL 环境变量或 /model 命令切换。
 
 运行：
   python3 yuanshen.py       （自动切换 piano_workflow/.venv 解释器；
@@ -69,6 +69,7 @@ def _bootstrap_interpreter():
         import anthropic  # noqa: F401
         import dotenv     # noqa: F401
         import prompt_toolkit  # noqa: F401
+        import openai     # noqa: F401
         return
     except ModuleNotFoundError:
         script = Path(__file__).resolve()
@@ -135,49 +136,203 @@ def read_esp32_reference() -> str:
     return content
 
 
-MODEL = "deepseek-v4-pro"
-BASE_URL = "https://api.deepseek.com/anthropic"
+THINKING = {"type": "disabled"}     # Anthropic 思考参数；非 Anthropic 官方端点不传
+
+MODEL_REGISTRY = {
+    "deepseek-v4-pro": {
+        "provider": "anthropic",
+        "api_name": "deepseek-v4-pro",
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "key_hint": "platform.deepseek.com → API Keys",
+        "supports_thinking": False,
+    },
+    "deepseek-v4-flash": {
+        "provider": "anthropic",
+        "api_name": "deepseek-v4-flash",
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "key_hint": "platform.deepseek.com → API Keys",
+        "supports_thinking": False,
+    },
+    "kimi-k3": {
+        "provider": "openai",
+        "api_name": "kimi-k3",
+        "base_url": "https://api.moonshot.cn/v1",
+        "api_key_env": "MOONSHOT_API_KEY",
+        "key_hint": "platform.moonshot.cn → API Key",
+        "supports_thinking": False,
+    },
+    "kimi-k2.7": {
+        "provider": "openai",
+        "api_name": "kimi-k2.7",
+        "base_url": "https://api.moonshot.cn/v1",
+        "api_key_env": "MOONSHOT_API_KEY",
+        "key_hint": "platform.moonshot.cn → API Key",
+        "supports_thinking": False,
+    },
+}
+
+DEFAULT_MODEL_ALIAS = "deepseek-v4-pro"
+_current_model_alias = os.getenv("MODEL", DEFAULT_MODEL_ALIAS).strip()
 API_KEY = None
-_client = None
-THINKING = {"type": "disabled"}     # 思考会吃掉 max_tokens 预算，agent 场景关闭
+_clients = {}  # provider -> client instance
+
+
+class _TextBlock:
+    type = "text"
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def model_dump(self):
+        return {"type": self.type, "text": self.text}
+
+
+class _ToolUseBlock:
+    type = "tool_use"
+
+    def __init__(self, id: str, name: str, input: dict):
+        self.id = id
+        self.name = name
+        self.input = input
+
+    def model_dump(self):
+        return {"type": self.type, "id": self.id,
+                "name": self.name, "input": self.input}
+
+
+class _UnifiedResponse:
+    def __init__(self, content: list, stop_reason: str):
+        self.content = content
+        self.stop_reason = stop_reason
+
+
+def current_model_config() -> dict:
+    """返回当前模型配置；未知别名回退到默认值并警告。"""
+    global _current_model_alias
+    alias = _current_model_alias
+    if alias not in MODEL_REGISTRY:
+        print(f"⚠ 未知模型 '{alias}'，回退到 {DEFAULT_MODEL_ALIAS}")
+        alias = DEFAULT_MODEL_ALIAS
+        _current_model_alias = alias
+    return MODEL_REGISTRY[alias]
+
+
+def current_model_alias() -> str:
+    return _current_model_alias
 
 
 def has_key() -> bool:
-    val = os.getenv("DEEPSEEK_API_KEY")
+    cfg = current_model_config()
+    val = os.getenv(cfg["api_key_env"])
     return bool(val and "sk-xxx" not in val and len(val) >= 20)
 
 
 def key_guidance() -> str:
+    cfg = current_model_config()
     env_file = SCRIPT_DIR / ".env"
-    return (f"缺少 DeepSeek API Key。保存方法：\n"
+    return (f"缺少 {cfg['api_key_env']}。保存方法：\n"
             f"  1. 编辑 {env_file}（没有就 cp .env.example .env）\n"
-            f"  2. 加一行：DEEPSEEK_API_KEY=你的Key\n"
-            f"     获取途径：DEEPSEEK_API_KEY（platform.deepseek.com → API Keys 页面创建）\n"
+            f"  2. 加一行：{cfg['api_key_env']}=你的Key\n"
+            f"     获取途径：{cfg['key_hint']}\n"
             f"  3. 保存后重新运行程序")
 
 
 def load_api_key() -> bool:
-    """固定使用 deepseek-v4-pro，不提供切换模型的入口。"""
-    global API_KEY, _client
+    """根据当前模型加载对应 API Key。"""
+    global API_KEY, _clients
     load_dotenv(SCRIPT_DIR / ".env", override=True)
+    cfg = current_model_config()
     if not has_key():
         API_KEY = None
         return False
-    API_KEY = os.getenv("DEEPSEEK_API_KEY")
-    _client = None
+    API_KEY = os.getenv(cfg["api_key_env"])
+    _clients = {}  # 切换模型/Key 后重建客户端
     return True
 
 
+def _get_anthropic_client(cfg: dict):
+    from anthropic import Anthropic
+    return Anthropic(api_key=API_KEY, base_url=cfg["base_url"])
+
+
+def _get_openai_client(cfg: dict):
+    from openai import OpenAI
+    return OpenAI(api_key=API_KEY, base_url=cfg["base_url"])
+
+
 def get_client():
-    global _client
-    if _client is None:
-        from anthropic import Anthropic
-        _client = Anthropic(api_key=API_KEY, base_url=BASE_URL)
-    return _client
+    cfg = current_model_config()
+    provider = cfg["provider"]
+    if provider not in _clients:
+        factory = _get_anthropic_client if provider == "anthropic" else _get_openai_client
+        _clients[provider] = factory(cfg)
+    return _clients[provider]
 
 
-def llm_create(**kwargs):
-    return get_client().messages.create(thinking=THINKING, **kwargs)
+def llm_create(model=None, system=None, messages=None, tools=None,
+               max_tokens=None, **kwargs):
+    """统一 LLM 调用：根据当前模型配置选择 Anthropic 或 OpenAI SDK。"""
+    cfg = current_model_config()
+    model_name = model or cfg["api_name"]
+    client = get_client()
+
+    if cfg["provider"] == "anthropic":
+        extra = {}
+        if cfg.get("supports_thinking"):
+            extra["thinking"] = THINKING
+        resp = client.messages.create(
+            model=model_name,
+            system=system,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            **extra,
+            **kwargs,
+        )
+        return _UnifiedResponse(resp.content, resp.stop_reason)
+
+    # OpenAI 兼容路径（Kimi / Moonshot）
+    openai_messages = []
+    if system:
+        openai_messages.append({"role": "system", "content": system})
+    openai_messages.extend(messages or [])
+    openai_tools = ([{"type": "function", "function": t} for t in tools]
+                    if tools else None)
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=openai_messages,
+        tools=openai_tools,
+        max_tokens=max_tokens,
+        **kwargs,
+    )
+    choice = resp.choices[0]
+    msg = choice.message
+    content = []
+    if msg.content:
+        content.append(_TextBlock(msg.content))
+    if msg.tool_calls:
+        for tc in msg.tool_calls:
+            content.append(_ToolUseBlock(
+                tc.id,
+                tc.function.name,
+                json.loads(tc.function.arguments),
+            ))
+    stop_reason = "tool_use" if msg.tool_calls else choice.finish_reason
+    return _UnifiedResponse(content, stop_reason)
+
+
+def switch_model(alias: str) -> bool:
+    """切换当前会话使用的模型；不修改 .env。"""
+    global _current_model_alias, API_KEY, _clients
+    alias = alias.strip()
+    if alias not in MODEL_REGISTRY:
+        return False
+    _current_model_alias = alias
+    API_KEY = None
+    _clients = {}
+    return True
 
 
 # =============================================================================
@@ -250,7 +405,7 @@ def normalize_task_input(user_input: str, current_wiring: str,
     if feedback:
         sections.append(f"【用户修改意见】\n{feedback}")
     response = llm_create(
-        model=MODEL,
+        model=current_model_alias(),
         max_tokens=4000,
         system=NORMALIZE_SYSTEM,
         messages=[{"role": "user", "content": "\n\n".join(sections)}],
@@ -1148,7 +1303,7 @@ def write_round_snapshot(call_no: int, elapsed: int, system: str, tools: list,
         f"- 累计时间：{elapsed} 秒",
         f"- 结果：{status}",
         f"- 作用和目的：{purpose}",
-        f"- 模型：{MODEL}",
+        f"- 模型：{current_model_alias()}",
         "",
         "## System Prompt",
         "",
@@ -1205,8 +1360,8 @@ def agent_loop(messages: list, run_log: dict, task_start: float):
     call_no = 0
     while True:
         call_no += 1
-        response = llm_create(model=MODEL, system=system, messages=messages,
-                              tools=tools, max_tokens=8000)
+        response = llm_create(model=current_model_alias(), system=system,
+                              messages=messages, tools=tools, max_tokens=8000)
 
         # 用户端输出由程序统一渲染；模型中间分析和工具原始结果不上屏。
         if response.stop_reason != "tool_use":
@@ -1245,7 +1400,7 @@ def agent_loop(messages: list, run_log: dict, task_start: float):
                                     "直接输出进度报告：1) 已完成什么 2) 卡在哪里 3) 下一步建议。"})
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": results})
-            report = llm_create(model=MODEL, system=system,
+            report = llm_create(model=current_model_alias(), system=system,
                                 messages=messages, max_tokens=4000)
             for block in report.content:
                 if getattr(block, "type", None) == "text":
@@ -1379,7 +1534,7 @@ def render_flow_md(user_input: str, run_log: dict) -> str:
     lines = [f"# 任务流程记录",
              f"",
              f"- 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-             f"- 模型：{MODEL}",
+             f"- 模型：{current_model_alias()}",
              f"- 用户需求：{user_input}",
              f"- 总耗时：{run_log.get('elapsed', '?')} 秒，"
              f"共 {len(run_log['rounds'])} 轮工具调用"
@@ -1425,7 +1580,8 @@ def extract_skill(flow_md: str, run_dir: Path):
     "保留上下文继续对话修改"，将拼进下一轮用户消息。"""
     try:
         existing = "\n现有技能（勿重复提取）：\n" + SKILLS.get_descriptions()
-        resp = llm_create(model=MODEL, max_tokens=1500, system=EXTRACT_SYSTEM,
+        resp = llm_create(model=current_model_alias(), max_tokens=1500,
+                          system=EXTRACT_SYSTEM,
                           messages=[{"role": "user",
                                      "content": flow_md[:8000] + existing}])
         raw = _text_of(resp).strip()
@@ -1561,7 +1717,8 @@ def cmd_work():
     print(f"  音频验收模式: {AUDIO_VALIDATION_MODE}")
     print(f"  技能知识库: {'✓ ' + str(len(SKILLS.skills)) + ' 个分块' if SKILLS.skills else '✗ 无'}")
     print(f"  任务文件夹: ✓ {FILES_DIR}（每任务仅保留最终代码和完整 user prompt）")
-    print(f"  大模型 API: {'✓ ' + MODEL if has_key() else '✗ 缺 DeepSeek Key（见 .env.example）'}")
+    cfg = current_model_config()
+    print(f"  大模型 API: {'✓ ' + current_model_alias() if has_key() else '✗ 缺 ' + cfg['api_key_env'] + '（见 .env.example）'}")
     print("  固件烧录 (esptool/erase_flash): ✗ 安全红线，永久禁止")
 
 
@@ -1635,9 +1792,31 @@ def cmd_doc(arg: str):
           f"   存放于 {dest}，立即生效（/skill 可查看）。")
 
 
+def cmd_model(arg: str = ""):
+    """查看或切换当前会话使用的大模型。"""
+    arg = arg.strip()
+    if not arg:
+        print("== 可用模型 ==")
+        for alias, cfg in MODEL_REGISTRY.items():
+            marker = "[*]" if alias == current_model_alias() else "[ ]"
+            print(f"  {marker} {alias}: {cfg['provider']} @ {cfg['base_url']}")
+        print(f"\n当前：{current_model_alias()}")
+        return
+    if switch_model(arg):
+        if load_api_key():
+            cfg = current_model_config()
+            masked = API_KEY[:3] + "*" * 6 + API_KEY[-2:]
+            print(f"✅ 已切换为 {current_model_alias()} ({cfg['provider']}) @ {cfg['base_url']}（Key: {masked}）")
+        else:
+            print(f"✅ 已切换为 {current_model_alias()}，但尚未配置对应 Key；请设置 {current_model_config()['api_key_env']}")
+    else:
+        available = ", ".join(MODEL_REGISTRY)
+        print(f"❌ 未知模型 '{arg}'。可用：{available}")
+
+
 COMMANDS = {"/tool": cmd_tool, "/skill": cmd_skill,
             "/work": cmd_work, "/wiring": cmd_wiring,
-            "/audio": cmd_audio}
+            "/audio": cmd_audio, "/model": cmd_model}
 
 
 # =============================================================================
@@ -1648,15 +1827,18 @@ COMMANDS = {"/tool": cmd_tool, "/skill": cmd_skill,
 def main():
     print(f"Yuanshen v{APP_VERSION} —— ESP32 单片机 agent - {WORKDIR}")
     if not load_api_key():
-        print("（暂无可用 Key，仅斜杠命令可用；存好 DEEPSEEK_API_KEY 后重新运行生效）")
+        cfg = current_model_config()
+        print(f"（暂无可用 Key，仅斜杠命令可用；存好 {cfg['api_key_env']} 后重新运行生效）")
     else:
+        cfg = current_model_config()
         masked = API_KEY[:3] + "*" * 6 + API_KEY[-2:]
-        print(f"模型: {MODEL} @ {BASE_URL}（Key: {masked}）")
+        print(f"模型: {current_model_alias()} ({cfg['provider']}) @ {cfg['base_url']}（Key: {masked}）")
     print(f"技能: {', '.join(SKILLS.skills) or '无'}")
     print(f"音频验收: {AUDIO_VALIDATION_MODE}")
     init_mcp()
-    print("命令: /tool 看工具 | /work 看能力 | /audio 开关音频 | "
-          "/skill 看技能 | /wiring 看接线 | /doc <md> 导入硬件文档 | exit 退出\n")
+    print("命令: /tool 看工具 | /work 看能力 | /model 切换模型 | "
+          "/audio 开关音频 | /skill 看技能 | /wiring 看接线 | "
+          "/doc <md> 导入硬件文档 | exit 退出\n")
 
     pending_context = None          # 用户选"继续对话修改"时的候选经验上下文
     while True:
@@ -1676,13 +1858,17 @@ def main():
             cmd_audio(user_input[7:])
             print()
             continue
+        if user_input == "/model" or user_input.startswith("/model "):
+            cmd_model(user_input[6:])
+            print()
+            continue
         if user_input == "/doc" or user_input.startswith("/doc "):
             cmd_doc(user_input[4:])
             print()
             continue
         if user_input.startswith("/"):
             print(f"未知命令 {user_input}。可用: "
-                  f"{', '.join(list(COMMANDS) + ['/audio on|off|required', '/doc <md路径>'])}\n")
+                  f"{', '.join(list(COMMANDS) + ['/audio on|off|required', '/model <alias>', '/doc <md路径>'])}\n")
             continue
         if not API_KEY:
             print(key_guidance() + "\n")
