@@ -2,9 +2,10 @@
 
 面向 ESP32 MicroPython 的闭环开发 Agent。用户确认规范化需求与接线后，Agent 自动完成编写代码、烧录为板上 `main.py`、实机测试和结果汇报。
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue)](./package.json)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://www.npmjs.com/package/yuanshen-esp32-agent)
 [![License](https://img.shields.io/badge/license-MIT-green)](./package.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](./requirements.txt)
+[![npm](https://img.shields.io/npm/v/yuanshen-esp32-agent)](https://www.npmjs.com/package/yuanshen-esp32-agent)
 
 ---
 
