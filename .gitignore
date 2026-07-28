@@ -1,0 +1,11 @@
+__pycache__/
+*.py[code]
+.env
+.venv/
+venv/
+files/
+file/*
+!file/.gitkeep
+backups/
+*.log
+.DS_Store
