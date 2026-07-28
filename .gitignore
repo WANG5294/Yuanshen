@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 .history
+.yuanshen/
 backups/
 *.log
 .DS_Store

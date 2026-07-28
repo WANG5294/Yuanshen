@@ -105,7 +105,7 @@ def read_input(message: str) -> str:
     if _HAS_PT and sys.stdin.isatty() and sys.stdout.isatty():
         if _session is None:
             _session = PromptSession(
-                history=FileHistory(str(SCRIPT_DIR / ".history")),
+                history=FileHistory(str(YUANSHEN_DIR / ".history")),
                 completer=WordCompleter(
                     SLASH_COMMANDS_WORDS,
                     meta_dict=SLASH_COMMANDS_META,
@@ -151,7 +151,31 @@ from dotenv import load_dotenv
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent                # Yuanshen/ → 项目根目录
-load_dotenv(SCRIPT_DIR / ".env")
+
+# 用户数据目录 ~/.yuanshen/（npm 全局安装后项目/配置/历史存于此）
+_YUANSHEN_HOME = Path.home() / ".yuanshen"
+YUANSHEN_DIR = _YUANSHEN_HOME
+try:
+    YUANSHEN_DIR.mkdir(parents=True, exist_ok=True)
+    (YUANSHEN_DIR / "projects").mkdir(exist_ok=True)
+except OSError:
+    # 降级：home 不可写时用脚本目录（容器/只读环境）
+    YUANSHEN_DIR = SCRIPT_DIR / ".yuanshen"
+    YUANSHEN_DIR.mkdir(parents=True, exist_ok=True)
+    (YUANSHEN_DIR / "projects").mkdir(exist_ok=True)
+
+# 优先读取 ~/.yuanshen/.env，其次项目目录 .env（兼容旧版）
+yuanshen_env = YUANSHEN_DIR / ".env"
+if yuanshen_env.exists():
+    load_dotenv(yuanshen_env)
+else:
+    load_dotenv(SCRIPT_DIR / ".env")
+    # 首次运行：从 .env.example 复制模板
+    if not yuanshen_env.exists() and (SCRIPT_DIR / ".env.example").exists():
+        import shutil
+        shutil.copy2(SCRIPT_DIR / ".env.example", yuanshen_env)
+        print(f"📁 已创建 {yuanshen_env}，请编辑填入 API Key")
+        print(f"   或使用程序内 /api-key 命令设置\n")
 
 # httpx 不支持 socks:// 代理 scheme（Clash 等会设 all_proxy=socks://...），
 # 否则创建 API 客户端时报 "Unknown scheme for proxy URL"。
@@ -162,9 +186,9 @@ for _k in ("ALL_PROXY", "all_proxy"):
 
 WORKDIR = Path.cwd()
 SKILLS_DIR = SCRIPT_DIR / "skills"
-FILES_DIR = SCRIPT_DIR / "file"         # v4：每个任务保存逐轮完整快照与最终产物
-PROJECTS_DIR = SCRIPT_DIR / "project"   # 项目目录（/new 创建的项目在此）
-WIRING_FILE = SCRIPT_DIR / "wiring.md"  # 当前接线事实（可被项目切换）
+FILES_DIR = SCRIPT_DIR / "file"         # v4 兼容：旧版 task 目录
+PROJECTS_DIR = YUANSHEN_DIR / "projects"   # 项目目录 ~/.yuanshen/projects/
+WIRING_FILE = SCRIPT_DIR / "wiring.md"  # 默认接线模板（项目本地有副本）
 ESP32_REFERENCE_FILE = (
     SCRIPT_DIR / "docs/reference/修正ESP32_D0WD_硬件开发手册.md"
 )
@@ -296,17 +320,20 @@ def has_key() -> bool:
 
 def key_guidance() -> str:
     cfg = current_model_config()
-    env_file = SCRIPT_DIR / ".env"
+    env_file = YUANSHEN_DIR / ".env"
     return (f"缺少 {cfg['api_key_env']}。保存方法：\n"
-            f"  1. 编辑 {env_file}（没有就 cp .env.example .env）\n"
+            f"  1. 编辑 {env_file}（首次运行已自动从 .env.example 创建）\n"
             f"  2. 加一行：{cfg['api_key_env']}=你的Key\n"
             f"     获取途径：{cfg['key_hint']}\n"
-            f"  3. 保存后重新运行程序")
+            f"  3. 保存后重新运行程序，或在程序内使用 /api-key 命令")
 
 
 def load_api_key() -> bool:
     """根据当前模型加载对应 API Key。"""
     global API_KEY, _clients
+    yuanshen_env = YUANSHEN_DIR / ".env"
+    if yuanshen_env.exists():
+        load_dotenv(yuanshen_env, override=True)
     load_dotenv(SCRIPT_DIR / ".env", override=True)
     cfg = current_model_config()
     if not has_key():
@@ -318,8 +345,8 @@ def load_api_key() -> bool:
 
 
 def _save_api_key(env_name: str, key_value: str) -> None:
-    """保存 API Key 到 .env 文件（覆盖或追加）。"""
-    env_path = SCRIPT_DIR / ".env"
+    """保存 API Key 到 ~/.yuanshen/.env 文件（覆盖或追加）。"""
+    env_path = YUANSHEN_DIR / ".env"
     lines = []
     found = False
     if env_path.exists():
@@ -334,8 +361,10 @@ def _save_api_key(env_name: str, key_value: str) -> None:
     if not found:
         new_lines.append(f"{env_name}={key_value}")
     env_path.write_text("\n".join(new_lines) + "\n")
+    # 重新加载环境变量
+    if env_path.exists():
+        load_dotenv(env_path, override=True)
     console.print(f"[dim]已保存到 {env_path}[/dim]")
-    load_dotenv(SCRIPT_DIR / ".env", override=True)
 
 
 def _get_anthropic_client(cfg: dict):
@@ -1912,7 +1941,7 @@ def cmd_work():
 
     cfg = current_model_config()
     api_status = (f"[green]✓[/green] {current_model_alias()}"
-                  if has_key() else f"[red]✗[/red] 缺 {cfg['api_key_env']}（见 .env.example）")
+                  if has_key() else f"[red]✗[/red] 缺 {cfg['api_key_env']}（使用 /api-key 设置）")
     table.add_row("大模型 API", api_status)
     table.add_row("固件烧录", "[red]✗[/red] 安全红线，永久禁止")
 
