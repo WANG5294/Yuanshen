@@ -2095,6 +2095,14 @@ def slugify(text: str) -> str:
     return text[:30].strip("-").lower() or "project"
 
 
+def _display_path(p: Path) -> str:
+    """尽量显示相对 SCRIPT_DIR 的短路径；不在其下（如 ~/.yuanshen/projects）则显示绝对路径。"""
+    try:
+        return str(p.relative_to(SCRIPT_DIR))
+    except ValueError:
+        return str(p)
+
+
 def cmd_new_project(arg: str = ""):
     """新建 ESP32 项目。"""
     name = arg.strip()
@@ -2118,7 +2126,7 @@ def cmd_new_project(arg: str = ""):
         (project_dir / "wiring.md").write_text("（无接线）\n")
 
     console.print(f"[green]✅ 项目 '{name}' 已创建[/green]")
-    console.print(f"[dim]   {project_dir.relative_to(SCRIPT_DIR)}[/dim]")
+    console.print(f"[dim]   {_display_path(project_dir)}[/dim]")
     console.print("[cyan]请输入你的 ESP32 需求，Agent 会先输出接线文档，确认后开始实施。[/cyan]")
     return project_dir
 
@@ -2318,7 +2326,7 @@ def main():
                     previous_result="任务开始", previous_tools="无",
                 ),
             }]
-            console.print(f"[dim][项目实施][/dim] {CURRENT_TASK_DIR.relative_to(SCRIPT_DIR)}")
+            console.print(f"[dim][项目实施][/dim] {_display_path(CURRENT_TASK_DIR)}")
             run_log = {"rounds": [], "prompt_input": content}
             try:
                 agent_loop(messages, run_log, task_start)
@@ -2335,7 +2343,7 @@ def main():
                 note, pending = extract_skill(flow_md, run_dir)
                 if pending:
                     pending_context = pending
-                console.print(f"[归档] {run_dir.relative_to(SCRIPT_DIR)} | {note}")
+                console.print(f"[归档] {_display_path(run_dir)} | {note}")
                 console.print("✅ [green]最终代码与完整 user prompt 已保存，可以继续提问或退出。[/green]")
             except Exception as e:
                 console.print(f"[red][归档失败][/red] {e}")
