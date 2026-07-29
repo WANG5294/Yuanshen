@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-PORT = "/dev/ttyACM0"
+PORT = "auto"   # mpremote 自动探测串口；需要指定时改成 "COM5" 或 "/dev/ttyACM0"
 MIC_DEVICE = "default"          # PipeWire; 录到全零请检查 VirtualBox 音频输入
 SAMPLE_RATE = 44100
 
@@ -58,9 +58,13 @@ def _metrics(summary: str, **values) -> str:
 
 def list_ports() -> str:
     """列出可用串口设备。"""
-    import glob
-    ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
-    return "\n".join(ports) if ports else "未发现串口设备(检查USB线和dialout权限)"
+    try:
+        from serial.tools import list_ports as _lp
+        ports = [f"{p.device}  {p.description}" for p in _lp.comports()]
+    except ImportError:
+        import glob
+        ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
+    return "\n".join(ports) if ports else "未发现串口设备(检查USB线；Linux 还需 dialout 权限)"
 
 
 def upload(local_path: str, remote_name: str = "") -> str:
