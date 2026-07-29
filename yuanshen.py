@@ -22,6 +22,7 @@ v4.0 将模型输入重构为“固定 System Prompt → 追加式 User/会话�
                      frontmatter 含 name/description），校验后装入
                      skills/ 立即生效，换硬件零改代码
       /wiring        查看当前接线（普通任务确认规范化结果后自动更新）
+      /port          查看/切换连接 ESP32 的串口（确认规范化接线时可一并修改）
   - 名称统一为 Yuanshen
 
 继承 v2 的核心：agent 循环与循环摘要、主线任务 TodoWrite（烧录卡点+
@@ -71,7 +72,7 @@ except ImportError:
 
 
 SLASH_COMMANDS_WORDS = ["/tool", "/skill", "/work", "/wiring", "/audio",
-                  "/model", "/doc", "/api-key", "/help", "/exit",
+                  "/model", "/doc", "/api-key", "/port", "/help", "/exit",
                   "/rounds", "/new", "/history"]
 
 SLASH_COMMANDS_META = {
@@ -83,6 +84,7 @@ SLASH_COMMANDS_META = {
     "/model": "🤖 切换大语言模型",
     "/doc": "📄 导入硬件说明文档为技能",
     "/api-key": "🔑 查看/更新 API Key",
+    "/port": "🔌 查看/切换连接 ESP32 的串口",
     "/new": "📁 创建新 ESP32 项目",
     "/history": "📖 浏览历史项目",
     "/help": "❓ 显示帮助",
@@ -198,6 +200,10 @@ APP_VERSION = "1.0"
 AUDIO_VALIDATION_MODE = os.getenv("AUDIO_VALIDATION_MODE", "auto").strip().lower()
 if AUDIO_VALIDATION_MODE not in ("auto", "required", "off"):
     AUDIO_VALIDATION_MODE = "auto"
+
+# 连接 ESP32 的串口："auto" 由 mpremote 自动探测；可用 ESP32_PORT 环境变量
+# 或 /port 命令指定（如 COM5、/dev/ttyACM0），MCP 服务器进程继承该环境变量。
+ESP32_PORT = os.getenv("ESP32_PORT", "auto").strip() or "auto"
 
 
 def read_wiring() -> str:
@@ -345,7 +351,7 @@ def load_api_key() -> bool:
 
 
 def _save_api_key(env_name: str, key_value: str) -> None:
-    """保存 API Key 到 ~/.yuanshen/.env 文件（覆盖或追加）。"""
+    """保存键值到 ~/.yuanshen/.env 文件（覆盖或追加；API Key、串口等通用）。"""
     env_path = YUANSHEN_DIR / ".env"
     lines = []
     found = False
@@ -386,9 +392,14 @@ def get_client():
     return _clients[provider]
 
 
+_force_tool_rejected = set()  # 记录拒绝强制 tool_choice 的端点（base_url），本会话不再重试
+
+
 def llm_create(model=None, system=None, messages=None, tools=None,
-               max_tokens=None, **kwargs):
-    """统一 LLM 调用：根据当前模型配置选择 Anthropic 或 OpenAI SDK。"""
+               max_tokens=None, force_tool=None, **kwargs):
+    """统一 LLM 调用：根据当前模型配置选择 Anthropic 或 OpenAI SDK。
+    force_tool 传入工具名时强制模型调用该工具（结构化输出的硬约束）。
+    端点曾 400 拒绝 tool_choice 时自动降级为普通工具模式。"""
     cfg = current_model_config()
     model_name = model or cfg["api_name"]
     client = get_client()
@@ -397,15 +408,35 @@ def llm_create(model=None, system=None, messages=None, tools=None,
         extra = {}
         if cfg.get("supports_thinking"):
             extra["thinking"] = THINKING
-        resp = client.messages.create(
-            model=model_name,
-            system=system,
-            messages=messages,
-            tools=tools,
-            max_tokens=max_tokens,
-            **extra,
-            **kwargs,
-        )
+        if force_tool and cfg["base_url"] not in _force_tool_rejected:
+            extra["tool_choice"] = {"type": "tool", "name": force_tool}
+        try:
+            resp = client.messages.create(
+                model=model_name,
+                system=system,
+                messages=messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                **extra,
+                **kwargs,
+            )
+        except Exception as e:
+            if "tool_choice" in extra and "tool_choice" in str(e):
+                # 端点（如 DeepSeek 思考模式）不支持强制 tool_choice：记住并降级重试
+                _force_tool_rejected.add(cfg["base_url"])
+                console.print("[dim]端点不支持强制 tool_choice，本会话改用普通工具模式[/dim]")
+                del extra["tool_choice"]
+                resp = client.messages.create(
+                    model=model_name,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    **extra,
+                    **kwargs,
+                )
+            else:
+                raise
         return _UnifiedResponse(resp.content, resp.stop_reason)
 
     # OpenAI 兼容路径（Kimi / Moonshot）
@@ -413,8 +444,14 @@ def llm_create(model=None, system=None, messages=None, tools=None,
     if system:
         openai_messages.append({"role": "system", "content": system})
     openai_messages.extend(messages or [])
-    openai_tools = ([{"type": "function", "function": t} for t in tools]
-                    if tools else None)
+    openai_tools = ([{"type": "function", "function": {
+        "name": t["name"],
+        "description": t.get("description", ""),
+        "parameters": t.get("input_schema", t.get("parameters", {})),
+    }} for t in tools] if tools else None)
+    if force_tool:
+        kwargs["tool_choice"] = {"type": "function",
+                                 "function": {"name": force_tool}}
     resp = client.chat.completions.create(
         model=model_name,
         messages=openai_messages,
@@ -473,23 +510,39 @@ NORMALIZE_SYSTEM = """你是 ESP32 任务需求与接线文档规范化器。你
    在括号内补充同一节点说明。GPIO 统一写作 GPIOxx，电源统一写 VCC(3.3V)、+5V、GND。
 7. 若原接线存在危险、矛盾或不足以实现需求，不要静默修正；原样表达拓扑，并在需求末尾
    增加“待用户确认：……”说明。
-8. 不输出分析、建议、Markdown 代码围栏或任何额外字段。
+8. 不输出分析、建议或任何额外字段。
 
-只输出严格 JSON：
-{"requirement":"确认后交给 Agent 的完整需求","wiring":"确认后写入 wiring.md 的完整接线文档","audio_required":true或false}"""
+完成后必须调用 submit_normalized_task 工具提交结果。"""
 
 
-def _parse_normalized_task(raw: str) -> tuple[str, str, bool]:
-    """解析规范化器的 JSON 输出，拒绝空字段和异常膨胀内容。"""
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        raise ValueError("模型未返回 JSON 对象")
-    data = json.loads(match.group(0))
+# 规范化结果通过工具调用提交：API 层强制 schema，模型没有自由文本出口
+NORMALIZE_TOOL = {
+    "name": "submit_normalized_task",
+    "description": "提交规范化后的需求与接线文档",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "requirement": {"type": "string",
+                            "description": "确认后交给 Agent 的完整需求"},
+            "wiring": {"type": "string",
+                       "description": "确认后写入 wiring.md 的完整接线文档"},
+            "audio_required": {"type": "boolean",
+                               "description": "任务是否需要音频闭环验证"},
+        },
+        "required": ["requirement", "wiring", "audio_required"],
+    },
+}
+
+
+def _validate_normalized(data: dict) -> tuple[str, str, bool]:
+    """校验规范化结果字段，拒绝空字段和异常膨胀内容。"""
     requirement = data.get("requirement")
     wiring = data.get("wiring")
     audio_required = data.get("audio_required")
     if not isinstance(requirement, str) or not isinstance(wiring, str):
-        raise ValueError("requirement 和 wiring 必须是字符串")
+        raise ValueError(
+            "requirement 和 wiring 必须是字符串，实际返回："
+            + str(data)[:300])
     requirement = requirement.strip()
     wiring = wiring.strip()
     if not requirement or not wiring:
@@ -501,11 +554,35 @@ def _parse_normalized_task(raw: str) -> tuple[str, str, bool]:
     return requirement, wiring, audio_required
 
 
+def _parse_normalized_task(raw: str) -> tuple[str, str, bool]:
+    """从纯文本回复中提取 JSON（工具调用的兜底路径），失败时保留现场。"""
+    match = re.search(r"\{.*\}", raw or "", re.DOTALL)
+    if not match:
+        snippet = (raw or "").strip()[:300]
+        if not snippet:
+            raise ValueError("模型返回为空（可能是 API 抖动或限流）")
+        raise ValueError(f"模型未返回 JSON 对象，原始回复：{snippet}")
+    return _validate_normalized(json.loads(match.group(0)))
+
+
+def _normalized_from_response(response) -> tuple[str, str, bool]:
+    """优先取工具调用结果；兼容层不理会 tool_choice 时降级到文本 JSON 提取。"""
+    for block in response.content:
+        if (getattr(block, "type", None) == "tool_use"
+                and block.name == NORMALIZE_TOOL["name"]):
+            return _validate_normalized(block.input)
+    text = _text_of(response)
+    if not text.strip() and getattr(response, "stop_reason", "") == "max_tokens":
+        raise ValueError("模型输出被 max_tokens 截断（思考模式可能吃光了额度）")
+    return _parse_normalized_task(text)
+
+
 def normalize_task_input(user_input: str, current_wiring: str,
                          previous_requirement: str = "",
                          previous_wiring: str = "",
                          feedback: str = "") -> tuple[str, str, bool]:
-    """联合硬件手册与 wiring.md 规范化；此调用没有 Agent 工具或消息链。"""
+    """联合硬件手册与 wiring.md 规范化；此调用没有 Agent 工具或消息链。
+    结果通过强制工具调用提交（硬约束），失败自动重试。"""
     sections = [
         f"【用户本次原始输入】\n{user_input}",
         f"【当前 wiring.md】\n{current_wiring}",
@@ -519,13 +596,28 @@ def normalize_task_input(user_input: str, current_wiring: str,
         ])
     if feedback:
         sections.append(f"【用户修改意见】\n{feedback}")
-    response = llm_create(
-        model=current_model_alias(),
-        max_tokens=4000,
-        system=NORMALIZE_SYSTEM,
-        messages=[{"role": "user", "content": "\n\n".join(sections)}],
-    )
-    return _parse_normalized_task(_text_of(response))
+    last_err = None
+    force = NORMALIZE_TOOL["name"]
+    for attempt in (1, 2, 3):
+        try:
+            response = llm_create(
+                model=current_model_alias(),
+                max_tokens=8000,
+                system=NORMALIZE_SYSTEM,
+                messages=[{"role": "user", "content": "\n\n".join(sections)}],
+                tools=[NORMALIZE_TOOL],
+                force_tool=force,
+            )
+            return _normalized_from_response(response)
+        except Exception as e:
+            last_err = e
+            if force and "tool_choice" in str(e):
+                # 兼容层（如 DeepSeek 思考模式）拒绝强制 tool_choice：降级为普通工具模式
+                force = None
+                console.print("[dim]端点不支持强制 tool_choice，改用普通工具模式…[/dim]")
+            elif attempt < 3:
+                console.print(f"[dim]规范化失败（{e}），自动重试…[/dim]")
+    raise last_err
 
 
 def write_wiring(wiring: str):
@@ -561,16 +653,24 @@ def confirm_normalized_task(user_input: str) -> tuple[str, str, bool] | None:
             console.print("[dim]本次任务未进入 Agent 循环，wiring.md 未修改。[/dim]")
             return None
 
-        console.print(Panel(requirement, title="📋 待确认：规范化需求",
-                            border_style="cyan"))
-        console.print(Panel(wiring, title="🔌 待确认：规范化接线",
-                            border_style="green"))
-        try:
-            answer = read_input(
-                "确认以上内容？[y=确认并启动 / 输入修改意见=重新优化 / "
-                "n=取消任务]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            answer = "n"
+        while True:
+            console.print(Panel(requirement, title="📋 待确认：规范化需求",
+                                border_style="cyan"))
+            console.print(Panel(wiring, title="🔌 待确认：规范化接线",
+                                border_style="green"))
+            port_line = ESP32_PORT + ("（mpremote 自动探测）" if ESP32_PORT == "auto" else "")
+            console.print(f"[dim]🔌 连接串口: {port_line}（如需修改，回答 port COM5；"
+                          "任务外也可随时用 /port 命令）[/dim]")
+            try:
+                answer = read_input(
+                    "确认以上内容？[y=确认并启动 / 输入修改意见=重新优化 / "
+                    "port <串口>=切换串口 / n=取消任务]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
+            if answer.lower().startswith("port"):
+                cmd_port(answer[4:].strip())
+                continue          # 串口变更不触发重新规范化，直接重显草案
+            break
 
         if answer.lower() in ("y", "yes", "是", "确认"):
             try:
@@ -599,7 +699,9 @@ def confirm_normalized_task(user_input: str) -> tuple[str, str, bool] | None:
 _MCP_PY = SCRIPT_DIR / "esp32_piano_mcp.py"
 if not _MCP_PY.exists():
     _MCP_PY = PROJECT_ROOT / "piano_workflow" / "esp32_piano_mcp.py"
-VENV_PY = SCRIPT_DIR / ".venv" / "bin" / "python"
+VENV_PY = SCRIPT_DIR / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+if not VENV_PY.exists():
+    VENV_PY = SCRIPT_DIR / ".venv" / "bin" / "python"
 if not VENV_PY.exists():
     VENV_PY = PROJECT_ROOT / "piano_workflow" / ".venv" / "bin" / "python"
 if not VENV_PY.exists():
@@ -698,8 +800,14 @@ class MCPClient:
     def list_tools(self) -> list:
         return self._request("tools/list").get("tools", [])
 
-    def call_tool(self, name: str, arguments: dict) -> str:
-        result = self._request("tools/call", {"name": name, "arguments": arguments})
+    def call_tool(self, name: str, arguments: dict, timeout: float = None) -> str:
+        # upload 等慢工具内部超时（120s+重试）可能超过默认 180s，
+        # 允许按调用放大超时，避免 agent 只收到笼统的“MCP 调用超时”
+        saved, self.timeout = self.timeout, timeout or self.timeout
+        try:
+            result = self._request("tools/call", {"name": name, "arguments": arguments})
+        finally:
+            self.timeout = saved
         parts = [c.get("text", "") for c in result.get("content", [])
                  if c.get("type") == "text"]
         text = "\n".join(p for p in parts if p)
@@ -1104,7 +1212,11 @@ def build_user_prompt(user_input: str, round_no: int, elapsed: int,
 
 def base_tools() -> list:
     return [
-        {"name": "bash", "description": "执行 shell 命令。",
+        {"name": "bash", "description": (
+            "执行受限 shell 命令（禁止管道、重定向、变量展开、复合命令）。"
+            "仅允许：python -m py_compile、ruff、mypy、mpy-cross、ls、rg、"
+            "head、tail、wc、file、git status/diff/log/show/rev-parse。"
+            "写文件用 write_file，查串口/烧录/板载操作用 MCP 设备工具。"),
          "input_schema": {"type": "object",
                           "properties": {"command": {"type": "string"}},
                           "required": ["command"]}},
@@ -1153,8 +1265,9 @@ def get_all_tools() -> list:
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"路径越出工作目录: {p}")
+    # 任务项目目录（~/.yuanshen/projects）也是合法工作区，不只 WORKDIR
+    if not any(path.is_relative_to(root) for root in (WORKDIR, PROJECTS_DIR)):
+        raise ValueError(f"路径越出允许目录（工作目录或项目目录）: {p}")
     return path
 
 
@@ -1305,7 +1418,7 @@ def execute_tool(name: str, args: dict) -> str:
             TODO.audio_degraded_reason = ""
             TODO.deployed_hash = None
         try:
-            out = MCP_CLIENTS[name].call_tool(name, args)
+            out = MCP_CLIENTS[name].call_tool(name, args, timeout=400)
         except Exception as e:
             return f"Error: MCP 工具 {name} 调用失败: {e}"
         if dest == "main.py" and not out.startswith("Error"):
@@ -1961,6 +2074,44 @@ def cmd_wiring():
                   "也可直接编辑该文件，下一次规范化会读取最新内容。[/dim]")
 
 
+def cmd_port(arg: str = ""):
+    """查看或切换连接 ESP32 的串口（持久化到 ~/.yuanshen/.env）。"""
+    global ESP32_PORT
+    arg = arg.strip()
+    if not arg:
+        current = ESP32_PORT + ("（mpremote 自动探测）" if ESP32_PORT == "auto" else "")
+        console.print(f"[dim]当前串口: {current}[/dim]")
+        try:
+            from serial.tools import list_ports as _lp
+            ports = [f"{p.device}  {p.description}" for p in _lp.comports()]
+            console.print("[dim]可用串口: " + ("\n  " + "\n  ".join(ports) if ports
+                                              else "未发现") + "[/dim]")
+        except ImportError:
+            pass
+        try:
+            arg = read_input(
+                "输入串口（如 COM5 / /dev/ttyACM0，auto=自动探测，直接回车取消）: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("[dim]未修改串口。[/dim]")
+            return
+        if not arg:
+            console.print("[yellow]已取消[/yellow]")
+            return
+    ESP32_PORT = arg
+    os.environ["ESP32_PORT"] = arg
+    _save_api_key("ESP32_PORT", arg)
+    # 热更新已运行的 MCP 服务器（esp32_piano_mcp 的 set_port 工具）
+    client = MCP_CLIENTS.get("set_port")
+    if client is not None:
+        try:
+            console.print(f"[dim]{client.call_tool('set_port', {'port': arg})}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ 已保存，但热更新 MCP 服务器失败：{e}（重启后生效）[/yellow]")
+    console.print(f"[green]✅ 串口已切换为: {arg}"
+                  + ("（自动探测）" if arg == "auto" else "") + "[/green]")
+
+
 def cmd_audio(arg: str = ""):
     """查看或切换当前会话的音频验收模式。"""
     global AUDIO_VALIDATION_MODE
@@ -2210,7 +2361,7 @@ def cmd_api_key(arg: str = ""):
 COMMANDS = {"/tool": cmd_tool, "/skill": cmd_skill,
             "/work": cmd_work, "/wiring": cmd_wiring,
             "/audio": cmd_audio, "/model": cmd_model,
-            "/api-key": cmd_api_key, "/exit": cmd_exit}
+            "/api-key": cmd_api_key, "/port": cmd_port, "/exit": cmd_exit}
 
 
 # =============================================================================
@@ -2270,6 +2421,10 @@ def main():
             cmd_audio(user_input[7:])
             print()
             continue
+        if user_input.startswith("/port "):
+            cmd_port(user_input[6:])
+            print()
+            continue
         if user_input == "/model" or user_input.startswith("/model "):
             cmd_model(user_input[6:])
             print()
@@ -2292,7 +2447,7 @@ def main():
             continue
         if user_input.startswith("/"):
             console.print(f"[red]未知命令 {rich_escape(user_input)}[/red]。可用: "
-                          f"[yellow]{', '.join(list(COMMANDS) + ['/audio on|off|required', '/model <alias>', '/doc <md路径>', '/new 项目名', '/history'])}[/yellow]\n")
+                          f"[yellow]{', '.join(list(COMMANDS) + ['/audio on|off|required', '/model <alias>', '/doc <md路径>', '/port <串口>', '/new 项目名', '/history'])}[/yellow]\n")
             continue
         if not API_KEY:
             console.print(key_guidance() + "\n")

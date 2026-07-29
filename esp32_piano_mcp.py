@@ -12,8 +12,8 @@
        python3 esp32_piano_mcp.py compare_audio rec.wav preview.wav
 
 工具分两组:
-  设备通道: list_ports / upload / run_script / repl_exec /
-            device_ls / device_rm / soft_reset
+  设备通道: list_ports / get_port / set_port / upload / run_script /
+            repl_exec / device_ls / device_rm / soft_reset
   音频闭环: mic_check / record_audio / play_and_record /
             analyze_wav / compare_audio
 
@@ -21,6 +21,7 @@
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -29,7 +30,9 @@ from pathlib import Path
 
 import numpy as np
 
-PORT = "auto"   # mpremote 自动探测串口；需要指定时改成 "COM5" 或 "/dev/ttyACM0"
+# 串口：默认 auto 由 mpremote 自动探测；可用环境变量 ESP32_PORT 指定，
+# 运行期由 Agent 主程序通过 set_port 工具热切换（对应 /port 命令）。
+PORT = os.environ.get("ESP32_PORT", "auto").strip() or "auto"
 MIC_DEVICE = "default"          # PipeWire; 录到全零请检查 VirtualBox 音频输入
 SAMPLE_RATE = 44100
 
@@ -38,15 +41,64 @@ SAMPLE_RATE = 44100
 # 设备通道
 # =============================================================================
 
-def _mpremote(*args, timeout=30):
-    r = subprocess.run(
-        ["mpremote", "connect", PORT, *args],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    output = (r.stdout + r.stderr).strip() or "OK"
-    if r.returncode != 0:
-        raise RuntimeError(f"mpremote 失败（退出码 {r.returncode}）: {output}")
+def _classify_mpremote_error(output: str) -> str:
+    """把 mpremote 原始报错翻译成可操作的诊断建议（借鉴数科工具链的报错设计）。"""
+    low = output.lower()
+    if "in use by another program" in low or "failed to access" in low \
+            or "permissionerror" in low or "access is denied" in low:
+        return (f"串口 {PORT} 被其他程序独占（Windows 串口同一时刻只允许一个进程打开）。"
+                "常见占用方：另一个 Kimi 会话的 esp32-mcp 长连接（connect_esp32 后未 "
+                "disconnect_esp32）、串口监视器、Pymakr、另一个 Yuanshen 实例。"
+                "请先断开对应连接/关闭相关程序再重试，不要原地反复重试同一命令。")
+    if "could not open port" in low or "no such file" in low \
+            or "cannot find" in low or "系统找不到" in low:
+        return (f"串口 {PORT} 不存在或已掉线。请用 list_ports 重新枚举，"
+                "确认 USB 线连接后通过 set_port（对应主程序 /port 命令）切换到正确串口。")
+    if "no device found" in low:
+        return (f"mpremote 找不到设备 {PORT}。在 Windows 上这通常意味着："
+                "1) 串口正被其他程序独占（另一个 Kimi 会话的 esp32-mcp 长连接、"
+                "串口监视器、Pymakr 等，先断开/关闭再试）；"
+                "2) 板子掉线，请重新拔插 USB；"
+                "3) 串口号变了，用 list_ports 重新枚举并 set_port 切换。"
+                "不要原地反复重试同一命令。")
     return output
+
+
+def _mpremote_exe() -> str:
+    """定位 mpremote：优先当前解释器旁的同名可执行文件（venv 内必然存在），
+    避免裸依赖 PATH——直接运行 yuanshen.py 时 PATH 未必包含 venv/Scripts。"""
+    name = "mpremote.exe" if os.name == "nt" else "mpremote"
+    candidate = Path(sys.executable).parent / name
+    return str(candidate) if candidate.exists() else "mpremote"
+
+
+def _mpremote(*args, timeout=30, retries=2):
+    """调用 mpremote。端口被占用类错误会自动重试 retries 次（间隔 1s），
+    因为占用方可能正在释放；重试耗尽后抛出带诊断建议的 RuntimeError。"""
+    last_output = ""
+    for attempt in range(retries + 1):
+        try:
+            r = subprocess.run(
+                [_mpremote_exe(), "connect", PORT, *args],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "找不到 mpremote。请在 Yuanshen 的 venv 中安装："
+                "pip install mpremote"
+            ) from None
+        output = (r.stdout + r.stderr).strip() or "OK"
+        if r.returncode == 0:
+            return output
+        last_output = output
+        low = output.lower()
+        busy = ("in use by another program" in low or "failed to access" in low
+                or "access is denied" in low or "no device found" in low)
+        if busy and attempt < retries:
+            time.sleep(1)
+            continue
+        break
+    raise RuntimeError(_classify_mpremote_error(last_output))
 
 
 def _metrics(summary: str, **values) -> str:
@@ -54,6 +106,21 @@ def _metrics(summary: str, **values) -> str:
     return summary + "\nMETRICS_JSON:" + json.dumps(
         values, ensure_ascii=False, separators=(",", ":")
     )
+
+
+def get_port() -> str:
+    """查看当前使用的串口（auto 表示 mpremote 自动探测）。"""
+    return f"当前串口: {PORT}" + ("（自动探测）" if PORT == "auto" else "")
+
+
+def set_port(port: str) -> str:
+    """切换连接 ESP32 的串口，如 'COM5' 或 '/dev/ttyACM0'；传 'auto' 恢复自动探测。"""
+    global PORT
+    port = port.strip()
+    if not port:
+        return "Error: 串口名不能为空"
+    PORT = port
+    return f"串口已切换为: {PORT}" + ("（自动探测）" if PORT == "auto" else "")
 
 
 def list_ports() -> str:
@@ -64,7 +131,8 @@ def list_ports() -> str:
     except ImportError:
         import glob
         ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
-    return "\n".join(ports) if ports else "未发现串口设备(检查USB线；Linux 还需 dialout 权限)"
+    return ("\n".join(ports) if ports else "未发现串口设备(检查USB线；Linux 还需 dialout 权限)") \
+        + f"\n当前使用: {PORT}"
 
 
 def upload(local_path: str, remote_name: str = "") -> str:
@@ -106,7 +174,10 @@ def soft_reset() -> str:
     try:
         return _mpremote("soft-reset", timeout=10)
     except subprocess.TimeoutExpired:
-        return "软复位超时(可尝试拔插USB)"
+        return ("软复位超时。若板上 main.py 上电自动运行并抢占 REPL，恢复顺序："
+                "1) 确认无其他程序占用串口；2) 拔插 USB 后立即执行 repl_exec 或 "
+                "device_ls（mpremote 会在连接时发 Ctrl-C 抢在 main.py 前接管）；"
+                "3) 仍无效则 device_rm main.py 断掉自动运行。")
 
 
 # =============================================================================
@@ -341,8 +412,8 @@ def compare_audio(recorded: str, reference: str) -> str:
 # 入口: MCP 服务器 或 命令行
 # =============================================================================
 
-TOOL_FUNCS = [list_ports, upload, run_script, repl_exec, device_ls,
-              device_rm, soft_reset, mic_check, record_audio,
+TOOL_FUNCS = [list_ports, get_port, set_port, upload, run_script, repl_exec,
+              device_ls, device_rm, soft_reset, mic_check, record_audio,
               play_and_record, analyze_wav, compare_audio]
 
 
