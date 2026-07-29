@@ -1061,7 +1061,7 @@ def build_system() -> str:
 【禁止的操作 —— 安全红线】
 1. 禁止擦除 Flash（erase_flash）、刷写固件（esptool）
 2. 禁止危险 shell 命令：rm -rf /、sudo、shutdown、reboot、mkfs、dd 写设备
-3. 文件操作仅限当前工作目录内；串口仅限 /dev/ttyACM* 与 /dev/ttyUSB*
+3. 文件操作仅限当前工作目录内；串口仅限系统实际存在的 ESP32 串口设备（Linux 为 /dev/ttyACM* 与 /dev/ttyUSB*，Windows 为 COM*）
 4. GPIO34/35 是输入专用引脚，禁止配置为输出
 
 【迭代限制】单个任务最多 {MAX_ITERATIONS} 轮工具调用，耗尽后输出进度报告（已完成什么、卡在哪里、下一步建议）。"""
@@ -1895,14 +1895,20 @@ def cmd_skill():
 
 def cmd_work():
     import glob
-    ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
+    ports = []
+    try:
+        from serial.tools import list_ports  # pyserial（mpremote 的依赖）
+        ports = sorted(p.device for p in list_ports.comports())
+    except Exception:
+        ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
 
     table = Table(title="当前环境能力探测", border_style="dim")
     table.add_column("项目", style="cyan", no_wrap=True)
     table.add_column("状态")
 
+    port_hint = "检查USB线" if sys.platform == "win32" else "检查USB线/dialout权限"
     port_status = (f"[green]✓[/green] {', '.join(ports)}"
-                   if ports else "[red]✗[/red] 未发现（检查USB线/dialout权限）")
+                   if ports else f"[red]✗[/red] 未发现（{port_hint}）")
     table.add_row("串口设备", port_status)
 
     mp = shutil.which("mpremote")
