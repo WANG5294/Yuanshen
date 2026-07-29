@@ -1,6 +1,6 @@
 {
   "name": "yuanshen-esp32-agent",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Yuanshen — ESP32 MicroPython 闭环开发 Agent，带现代化终端 UI",
   "bin": {
     "yuanshen": "bin/yuanshen.js"
@@ -16,10 +16,20 @@
     "docs/",
     "README.md"
   ],
-  "os": ["linux", "darwin", "win32"],
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
   "engines": {
     "node": ">=16"
   },
-  "keywords": ["esp32", "micropython", "agent", "mcp", "embedded"],
+  "keywords": [
+    "esp32",
+    "micropython",
+    "agent",
+    "mcp",
+    "embedded"
+  ],
   "license": "MIT"
 }
