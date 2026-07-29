@@ -16,7 +16,7 @@
     "docs/",
     "README.md"
   ],
-  "os": ["linux", "darwin"],
+  "os": ["linux", "darwin", "win32"],
   "engines": {
     "node": ">=16"
   },
