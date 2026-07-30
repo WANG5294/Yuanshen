@@ -38,6 +38,7 @@ v4.0 将模型输入重构为“固定 System Prompt → 追加式 User/会话�
 import json
 import hashlib
 import os
+import platform
 import queue
 import re
 import shlex
@@ -392,14 +393,10 @@ def get_client():
     return _clients[provider]
 
 
-_force_tool_rejected = set()  # 记录拒绝强制 tool_choice 的端点（base_url），本会话不再重试
-
-
 def llm_create(model=None, system=None, messages=None, tools=None,
-               max_tokens=None, force_tool=None, **kwargs):
+               max_tokens=None, **kwargs):
     """统一 LLM 调用：根据当前模型配置选择 Anthropic 或 OpenAI SDK。
-    force_tool 传入工具名时强制模型调用该工具（结构化输出的硬约束）。
-    端点曾 400 拒绝 tool_choice 时自动降级为普通工具模式。"""
+    一律使用普通工具模式（模型自行决定是否调用工具）。"""
     cfg = current_model_config()
     model_name = model or cfg["api_name"]
     client = get_client()
@@ -408,35 +405,15 @@ def llm_create(model=None, system=None, messages=None, tools=None,
         extra = {}
         if cfg.get("supports_thinking"):
             extra["thinking"] = THINKING
-        if force_tool and cfg["base_url"] not in _force_tool_rejected:
-            extra["tool_choice"] = {"type": "tool", "name": force_tool}
-        try:
-            resp = client.messages.create(
-                model=model_name,
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=max_tokens,
-                **extra,
-                **kwargs,
-            )
-        except Exception as e:
-            if "tool_choice" in extra and "tool_choice" in str(e):
-                # 端点（如 DeepSeek 思考模式）不支持强制 tool_choice：记住并降级重试
-                _force_tool_rejected.add(cfg["base_url"])
-                console.print("[dim]端点不支持强制 tool_choice，本会话改用普通工具模式[/dim]")
-                del extra["tool_choice"]
-                resp = client.messages.create(
-                    model=model_name,
-                    system=system,
-                    messages=messages,
-                    tools=tools,
-                    max_tokens=max_tokens,
-                    **extra,
-                    **kwargs,
-                )
-            else:
-                raise
+        resp = client.messages.create(
+            model=model_name,
+            system=system,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            **extra,
+            **kwargs,
+        )
         return _UnifiedResponse(resp.content, resp.stop_reason)
 
     # OpenAI 兼容路径（Kimi / Moonshot）
@@ -449,9 +426,6 @@ def llm_create(model=None, system=None, messages=None, tools=None,
         "description": t.get("description", ""),
         "parameters": t.get("input_schema", t.get("parameters", {})),
     }} for t in tools] if tools else None)
-    if force_tool:
-        kwargs["tool_choice"] = {"type": "function",
-                                 "function": {"name": force_tool}}
     resp = client.chat.completions.create(
         model=model_name,
         messages=openai_messages,
@@ -515,7 +489,7 @@ NORMALIZE_SYSTEM = """你是 ESP32 任务需求与接线文档规范化器。你
 完成后必须调用 submit_normalized_task 工具提交结果。"""
 
 
-# 规范化结果通过工具调用提交：API 层强制 schema，模型没有自由文本出口
+# 规范化结果通过工具调用提交：提示词约束模型调用该工具；未调用时从文本中提取 JSON 兜底
 NORMALIZE_TOOL = {
     "name": "submit_normalized_task",
     "description": "提交规范化后的需求与接线文档",
@@ -566,7 +540,7 @@ def _parse_normalized_task(raw: str) -> tuple[str, str, bool]:
 
 
 def _normalized_from_response(response) -> tuple[str, str, bool]:
-    """优先取工具调用结果；兼容层不理会 tool_choice 时降级到文本 JSON 提取。"""
+    """优先取工具调用结果；模型未调用工具时降级到文本 JSON 提取。"""
     for block in response.content:
         if (getattr(block, "type", None) == "tool_use"
                 and block.name == NORMALIZE_TOOL["name"]):
@@ -582,7 +556,8 @@ def normalize_task_input(user_input: str, current_wiring: str,
                          previous_wiring: str = "",
                          feedback: str = "") -> tuple[str, str, bool]:
     """联合硬件手册与 wiring.md 规范化；此调用没有 Agent 工具或消息链。
-    结果通过强制工具调用提交（硬约束），失败自动重试。"""
+    结果通过工具调用提交（普通工具模式），失败自动重试，最多三次；
+    重试时把上一轮的错误反馈给模型（追加催告），纠正其行为而非盲重。"""
     sections = [
         f"【用户本次原始输入】\n{user_input}",
         f"【当前 wiring.md】\n{current_wiring}",
@@ -596,27 +571,29 @@ def normalize_task_input(user_input: str, current_wiring: str,
         ])
     if feedback:
         sections.append(f"【用户修改意见】\n{feedback}")
+    messages = [{"role": "user", "content": "\n\n".join(sections)}]
     last_err = None
-    force = NORMALIZE_TOOL["name"]
     for attempt in (1, 2, 3):
         try:
             response = llm_create(
                 model=current_model_alias(),
                 max_tokens=8000,
                 system=NORMALIZE_SYSTEM,
-                messages=[{"role": "user", "content": "\n\n".join(sections)}],
+                messages=messages,
                 tools=[NORMALIZE_TOOL],
-                force_tool=force,
             )
             return _normalized_from_response(response)
         except Exception as e:
             last_err = e
-            if force and "tool_choice" in str(e):
-                # 兼容层（如 DeepSeek 思考模式）拒绝强制 tool_choice：降级为普通工具模式
-                force = None
-                console.print("[dim]端点不支持强制 tool_choice，改用普通工具模式…[/dim]")
-            elif attempt < 3:
-                console.print(f"[dim]规范化失败（{e}），自动重试…[/dim]")
+            if attempt < 3:
+                console.print(f"[dim]规范化失败（{e}），自动重试…（第 {attempt + 1}/3 次）[/dim]")
+                # 追加催告：把错误反馈给模型，下一轮针对性纠错
+                messages.append({
+                    "role": "user",
+                    "content": (f"你上一轮的输出有问题：{e}\n"
+                                "请重新处理上面的需求，结果必须通过调用 "
+                                "submit_normalized_task 工具提交，不要直接输出文本。"),
+                })
     raise last_err
 
 
@@ -1114,8 +1091,29 @@ AUDIO_TOOL_NAMES = {
 # =============================================================================
 
 
+def _platform_desc() -> str:
+    """运行时探测宿主平台描述，注入系统提示词（泛用 Linux 虚拟机 / Windows 物理机等）。"""
+    system = platform.system() or "未知系统"
+    release = platform.release()
+    machine = platform.machine()
+    if system == "Windows":
+        serial_hint = "串口为 COM*（如 COM5）"
+        env_note = "物理机直连 USB 串口；若连接失败，优先排查串口被占用、驱动或线缆"
+    elif system == "Linux":
+        serial_hint = "串口为 /dev/ttyACM* 或 /dev/ttyUSB*"
+        env_note = ("若在虚拟机中运行，需确认 USB 串口设备已透传给虚拟机；"
+                    "物理机则检查串口权限（dialout 组）")
+    elif system == "Darwin":
+        serial_hint = "串口为 /dev/cu.usbserial-* 或 /dev/cu.wchusbserial-*"
+        env_note = "物理机直连 USB 串口"
+    else:
+        serial_hint = "串口名以系统实际枚举为准"
+        env_note = "按当前系统实际情况排查串口连接"
+    return (f"{system} {release}（{machine}），{serial_hint}。{env_note}。")
+
+
 def build_system() -> str:
-    return f"""你是 Yuanshen v1.0 正式版 —— ESP32 单片机开发 agent，运行在 Ubuntu 24.04 虚拟机中，工作目录 {WORKDIR}。
+    return f"""你是 Yuanshen v1.0 正式版 —— ESP32 单片机开发 agent，运行环境：{_platform_desc()}工作目录 {WORKDIR}。
 
 【身份与固定职责】你负责把用户确认后的 ESP32 目标推进到可验证的实机结果。你必须遵守本 System Prompt、使用已声明的 Skill 与工具、沿 TodoList 推进，并在硬件证据不足时如实报告失败。
 
@@ -1139,7 +1137,7 @@ def build_system() -> str:
 
 【工具总览】主要功能精简版（详细参数以工具定义为准）：
 - 本地：bash（shell）/ read_file / write_file / edit_file（文件自动落任务文件夹）/ Skill（按需加载知识）/ TodoWrite（主线进度）
-- MCP·设备通道：list_ports（列串口）/ upload（传文件，目标 main.py 才算烧录）/ run_script（带超时运行）/ repl_exec（板上执行代码）/ device_ls / device_rm（板上文件管理）/ soft_reset（打断死循环）
+- MCP·设备通道：list_ports（列串口）/ check_port（探测串口占用）/ connect_device（建立长连接，之后设备操作零握手）/ disconnect_device（释放串口）/ upload（传文件，目标 main.py 才算烧录）/ run_script（带超时运行）/ repl_exec（板上执行代码）/ device_ls / device_rm（板上文件管理）/ soft_reset（打断死循环）。设备通道默认长连接模式：首次设备调用自动建立并持有串口，任务期间其他程序无法占用；静默超时先 check_port
 - MCP·音频闭环：mic_check（录音通道自检）/ record_audio / play_and_record（软触发播放并录音）/ analyze_wav（基频/包络/哒声）/ compare_audio（录音 vs 预览对比）
 
 【规范化任务要求】以下内容由循环外的独立大模型参考 ESP32 硬件说明、用户确认的 wiring.md 和聊天框原始任务生成，并已由用户确认；它是本工程固定不变的唯一任务目标：

@@ -12,10 +12,15 @@
        python3 esp32_piano_mcp.py compare_audio rec.wav preview.wav
 
 工具分两组:
-  设备通道: list_ports / get_port / set_port / upload / run_script /
-            repl_exec / device_ls / device_rm / soft_reset
+  设备通道: list_ports / get_port / set_port / check_port /
+            connect_device / disconnect_device（长连接管理）/ upload /
+            run_script / repl_exec / device_ls / device_rm / soft_reset
   音频闭环: mic_check / record_audio / play_and_record /
             analyze_wav / compare_audio
+
+设备通道默认长连接模式（ESP32_DEVICE_MODE=persistent，pyserial 持久
+raw REPL 会话，MCP 进程常驻故跨工具调用存活；CLI 模式每次进程内自闭环）。
+设 ESP32_DEVICE_MODE=mpremote 回退为每次调用起 mpremote 子进程。
 
 依赖: mpremote, arecord(alsa-utils), numpy。分析全部用 numpy, 不需要 scipy。
 """
@@ -33,8 +38,189 @@ import numpy as np
 # 串口：默认 auto 由 mpremote 自动探测；可用环境变量 ESP32_PORT 指定，
 # 运行期由 Agent 主程序通过 set_port 工具热切换（对应 /port 命令）。
 PORT = os.environ.get("ESP32_PORT", "auto").strip() or "auto"
+# 设备通道模式：persistent（长连接，pyserial 持久 raw REPL 会话，默认）/
+# mpremote（每次调用起 mpremote 子进程，回退路径）。
+DEVICE_MODE = os.environ.get("ESP32_DEVICE_MODE", "persistent").strip() or "persistent"
 MIC_DEVICE = "default"          # PipeWire; 录到全零请检查 VirtualBox 音频输入
 SAMPLE_RATE = 44100
+
+
+# =============================================================================
+# 长连接会话：pyserial 持久 raw REPL（MCP 服务器进程常驻，会话跨工具调用存活）
+# =============================================================================
+
+class _ReplSession:
+    """持有串口的 raw REPL 长连接。惰性连接、出错自动重连一次。
+
+    协议要点（MicroPython raw REPL）：
+      进入: Ctrl-C ×2 打断运行中的程序，Ctrl-A 进 raw 模式，
+            设备回 'raw REPL; CTRL-B to exit\\r\\n>'；
+      执行: 发送代码 + Ctrl-D，设备回 'OK' + stdout + \\x04 + stderr + \\x04 + '>'；
+      复位: Ctrl-B 退出 raw 模式后 Ctrl-D 软复位。
+    打开串口前置 DTR/RTS=False，避免 Windows 下打开即触发板子复位。"""
+
+    def __init__(self):
+        self.ser = None
+        self.port = None
+        self._buf = b""                 # 读剩的响应缓存（设备常一次发完所有帧）
+
+    # ---- 底层 ----
+
+    def close(self):
+        if self.ser is not None:
+            try:
+                if self.ser.is_open:
+                    self.ser.write(b"\x02")      # Ctrl-B 退出 raw REPL
+                    self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+        self.port = None
+        self._buf = b""
+
+    def _read_until(self, token: bytes, timeout: float) -> bytes:
+        """读到 token 为止；token 之后的多余字节留在 _buf 供下次使用。"""
+        deadline = time.time() + timeout
+        while True:
+            if token in self._buf:
+                i = self._buf.index(token) + len(token)
+                out, self._buf = self._buf[:i], self._buf[i:]
+                return out
+            if time.time() >= deadline:
+                out, self._buf = self._buf, b""
+                return out
+            chunk = self.ser.read(256)
+            if chunk:
+                self._buf += chunk
+
+    def _open(self):
+        import serial
+        if PORT == "auto":
+            raise RuntimeError(
+                "长连接模式需要先用 set_port 指定串口（如 COM5）；"
+                "auto 可能误选蓝牙等虚拟串口。")
+        if self.ser is not None and self.port == PORT and self.ser.is_open:
+            return
+        self.close()
+        try:
+            s = serial.Serial()
+            s.port = PORT
+            s.baudrate = 115200
+            s.timeout = 0.1
+            s.dtr = False                # 关键：避免打开串口时复位开发板
+            s.rts = False
+            s.open()
+        except Exception as e:
+            raise RuntimeError(_classify_mpremote_error(str(e))) from None
+        self.ser, self.port = s, PORT
+        try:
+            s.reset_input_buffer()
+            s.write(b"\r\x03\x03")       # Ctrl-C ×2，打断运行中的 main.py
+            time.sleep(0.3)
+            s.reset_input_buffer()
+            s.write(b"\x01")             # Ctrl-A 进入 raw REPL
+            banner = self._read_until(b"raw REPL; CTRL-B to exit", 3)
+            if b"raw REPL" not in banner:
+                raise RuntimeError(
+                    f"已打开 {PORT} 但进不了 raw REPL（握手无应答）。"
+                    "板上 MicroPython 可能未在运行，或该串口对面不是 ESP32；"
+                    "Ctrl-C 可中断任何循环，不要归因于 main.py 死循环。")
+            self._read_until(b">", 1)
+        except Exception:
+            self.close()
+            raise
+
+    def _ensure(self):
+        """惰性连接；串口异常断开时重连一次。"""
+        try:
+            self._open()
+        except RuntimeError:
+            self.close()
+            self._open()
+
+    # ---- 上层操作 ----
+
+    def exec(self, code: str, timeout_s: float = 20) -> str:
+        self._ensure()
+        try:
+            self.ser.reset_input_buffer()
+            self._buf = b""
+            self.ser.write(code.encode("utf-8") + b"\x04")
+            out = self._read_until(b"\x04", timeout_s)
+            if b"\x04" not in out:
+                # 代码跑超时（如 while True）：Ctrl-C 打断，回收已有输出
+                self.ser.write(b"\x03")
+                time.sleep(0.2)
+                rest = self._read_until(b"\x04", 2)
+                self._read_until(b">", 1)
+                body = (out + rest).replace(b"OK", b"", 1)
+                return ("(执行超时, 已 Ctrl-C 打断)\n"
+                        + body.replace(b"\x04", b"").decode(errors="replace").strip())
+            err = self._read_until(b"\x04", 2)
+            self._read_until(b">", 1)
+            stdout = out[2:out.rfind(b"\x04")] if out.startswith(b"OK") \
+                else out.replace(b"\x04", b"")
+            stderr = err.replace(b"\x04", b"")
+            text = stdout.decode(errors="replace").strip()
+            if stderr.strip():
+                text += ("\n" if text else "") + stderr.decode(errors="replace").strip()
+            return text or "OK"
+        except RuntimeError:
+            raise
+        except Exception as e:            # 串口掉线等：重连一次再报错
+            self.close()
+            raise RuntimeError(
+                f"长连接会话中断（{e}）。已释放串口，下次调用会自动重连；"
+                "若反复失败，用 check_port 检查占用、list_ports 确认串口号。"
+            ) from None
+
+    def soft_reset_device(self) -> str:
+        self._ensure()
+        try:
+            self.ser.write(b"\x02")       # Ctrl-B 回 friendly REPL
+            time.sleep(0.1)
+            self.ser.write(b"\x04")       # Ctrl-D 软复位
+            time.sleep(1.2)               # 等固件启动 + main.py 自启
+            self.ser.write(b"\r\x03\x03") # 打断自启的 main.py
+            time.sleep(0.5)
+            self.ser.reset_input_buffer() # 丢掉启动横幅等噪声
+            self.ser.write(b"\x01")
+            banner = self._read_until(b"raw REPL; CTRL-B to exit", 3)
+            if b"raw REPL" not in banner:
+                raise RuntimeError("软复位后进不了 raw REPL（握手无应答）")
+            self._read_until(b">", 1)
+            return "已软复位并重新进入 REPL"
+        except Exception as e:
+            self.close()
+            raise RuntimeError(f"软复位失败（{e}），已释放串口，下次调用自动重连") from None
+
+    def upload(self, local_path: str, remote_name: str = "") -> str:
+        data = Path(local_path).read_bytes()
+        dest = remote_name or Path(local_path).name
+        self.exec(f"f=open({dest!r},'wb')")
+        try:
+            for i in range(0, len(data), 512):
+                self.exec(f"f.write(bytes.fromhex('{data[i:i+512].hex()}'))",
+                          timeout_s=30)
+        finally:
+            self.exec("f.close()")
+        return f"已上传 {local_path} -> :{dest}（{len(data)} 字节，长连接写入）"
+
+
+_SESSION = _ReplSession()
+
+
+def connect_device() -> str:
+    """建立到 ESP32 的长连接（raw REPL）。之后所有设备工具复用此连接，
+    不再每次握手；会话期间本进程独占串口，其他程序请勿同时连接。"""
+    _SESSION._ensure()
+    return f"长连接已建立: {PORT}（raw REPL，后续设备操作零握手开销）"
+
+
+def disconnect_device() -> str:
+    """断开长连接并释放串口。任务结束或需要把串口让给其他工具时调用。"""
+    _SESSION.close()
+    return "长连接已断开，串口已释放"
 
 
 # =============================================================================
@@ -64,6 +250,57 @@ def _classify_mpremote_error(output: str) -> str:
     return output
 
 
+def _classify_silent_timeout(timeout_s: float) -> str:
+    """subprocess 看门狗杀掉 mpremote（静默超时）的诊断。
+
+    关键事实：此时 mpremote 已成功打开串口（否则几秒内就会带错误退出），
+    死的是打开之后的 REPL 握手——它对着一条无应答的信道干等。这与板上
+    main.py 是否死循环无关：mpremote 连接时发的 Ctrl-C 是字节码级中断，
+    可以打断任何 while True（包括零让步循环）。正确归因方向：
+    1) CH9102/CH340（WCH）驱动不强制独占——另一进程占着串口时，本进程
+       仍能"打开成功"但拿到死信道，表现恰好是这种无报错的静默挂起。
+       最大嫌疑人：esp32-mcp 长连接（connect_esp32 未 disconnect）、
+       串口监视器、Thonny/Pymakr、未退出的 mpremote。
+    2) 串口选错（如 auto 探测到蓝牙虚拟串口）：端口能开但对面不是 ESP32。
+    处置：先用 check_port 探测占用情况，用 list_ports + set_port 固定正确
+    串口；确认无占用后再重试。禁止把它诊断为"main.py 死循环锁死 REPL"
+    并围绕复位/覆盖 main.py 空转。"""
+    return (f"mpremote 静默超时（{timeout_s}s 无任何输出被看门狗终止）：串口已打开"
+            "但 REPL 握手无应答。这不是 main.py 死循环（Ctrl-C 可中断任何循环）。"
+            "最可能是另一进程占着串口（WCH CH9102/CH340 驱动不强制独占，二次打开"
+            "会拿到无应答的死信道）或串口选错。请先用 check_port 探测，并用 "
+            "list_ports 确认当前连接的是 ESP32 所在串口（蓝牙虚拟串口能打开但"
+            "永远无应答）。")
+
+
+def check_port() -> str:
+    """主动探测当前串口是否可用，在动手前区分"被占用/不存在/空闲"。
+
+    用 pyserial 直接尝试打开-关闭当前 PORT：
+    - 打开失败 → 端口被独占或不存在（WCH 驱动除外，见下）；
+    - 打开成功 → 仅说明驱动层空闲。注意 CH9102/CH340 驱动不强制独占，
+      另一进程占用时这里也可能打开成功，需结合 list_ports 和实际 REPL
+      应答判断；本工具能确定的结论是"打不开=一定被占或不存在"。"""
+    if _SESSION.ser is not None and _SESSION.ser.is_open:
+        return (f"{_SESSION.port} 正被本进程的长连接持有（这是正常状态，"
+                "不是被外部占用）。外部程序此时无法使用该串口；"
+                "要释放请调用 disconnect_device。")
+    try:
+        import serial
+    except ImportError:
+        return "Error: 需要 pyserial（pip install pyserial）"
+    if PORT == "auto":
+        return ("当前为 auto 自动探测，无法定点检查。建议先 set_port 指定串口"
+                "（如 COM5），避免 auto 误选蓝牙等虚拟串口。")
+    try:
+        s = serial.Serial(PORT, 115200, timeout=1)
+        s.close()
+        return (f"{PORT} 可以打开（驱动层空闲）。提示：CH9102/CH340 驱动不强制独占，"
+                "若后续 REPL 仍静默超时，仍说明有另一进程持有该端口或对面不是 ESP32。")
+    except Exception as e:
+        return _classify_mpremote_error(str(e))
+
+
 def _mpremote_exe() -> str:
     """定位 mpremote：优先当前解释器旁的同名可执行文件（venv 内必然存在），
     避免裸依赖 PATH——直接运行 yuanshen.py 时 PATH 未必包含 venv/Scripts。"""
@@ -72,9 +309,11 @@ def _mpremote_exe() -> str:
     return str(candidate) if candidate.exists() else "mpremote"
 
 
-def _mpremote(*args, timeout=30, retries=2):
+def _mpremote(*args, timeout=30, retries=2, script_timeout=False):
     """调用 mpremote。端口被占用类错误会自动重试 retries 次（间隔 1s），
-    因为占用方可能正在释放；重试耗尽后抛出带诊断建议的 RuntimeError。"""
+    因为占用方可能正在释放；重试耗尽后抛出带诊断建议的 RuntimeError。
+    script_timeout=True 时（run_script 跑长脚本）不转换 TimeoutExpired，
+    由调用方按"脚本自身跑超时"处理（软复位+返回部分输出）。"""
     last_output = ""
     for attempt in range(retries + 1):
         try:
@@ -82,6 +321,11 @@ def _mpremote(*args, timeout=30, retries=2):
                 [_mpremote_exe(), "connect", PORT, *args],
                 capture_output=True, text=True, timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            if script_timeout:
+                raise
+            # 静默超时：串口打开了但 REPL 无应答，与 mpremote 报错分开诊断
+            raise RuntimeError(_classify_silent_timeout(timeout)) from None
         except FileNotFoundError:
             raise RuntimeError(
                 "找不到 mpremote。请在 Yuanshen 的 venv 中安装："
@@ -110,15 +354,22 @@ def _metrics(summary: str, **values) -> str:
 
 def get_port() -> str:
     """查看当前使用的串口（auto 表示 mpremote 自动探测）。"""
-    return f"当前串口: {PORT}" + ("（自动探测）" if PORT == "auto" else "")
+    mode = "长连接" if DEVICE_MODE == "persistent" else "mpremote 短连接"
+    held = "，长连接持有中" if (_SESSION.ser is not None
+                              and _SESSION.ser.is_open) else ""
+    return f"当前串口: {PORT}" + ("（自动探测）" if PORT == "auto" else "") \
+        + f"，设备通道: {mode}{held}"
 
 
 def set_port(port: str) -> str:
-    """切换连接 ESP32 的串口，如 'COM5' 或 '/dev/ttyACM0'；传 'auto' 恢复自动探测。"""
+    """切换连接 ESP32 的串口，如 'COM5' 或 '/dev/ttyACM0'；传 'auto' 恢复自动探测。
+    切换会释放当前长连接，下次设备调用时在新串口上自动重连。"""
     global PORT
     port = port.strip()
     if not port:
         return "Error: 串口名不能为空"
+    if port != PORT:
+        _SESSION.close()
     PORT = port
     return f"串口已切换为: {PORT}" + ("（自动探测）" if PORT == "auto" else "")
 
@@ -137,14 +388,19 @@ def list_ports() -> str:
 
 def upload(local_path: str, remote_name: str = "") -> str:
     """上传文件到 ESP32。remote_name 缺省用本地文件名。"""
+    if DEVICE_MODE == "persistent":
+        return _SESSION.upload(local_path, remote_name)
     dest = ":" + (remote_name or Path(local_path).name)
     return _mpremote("cp", local_path, dest, timeout=120)
 
 
 def run_script(path: str, timeout_s: float = 20) -> str:
     """运行本地脚本并捕获输出。超时自动 Ctrl-C 复位(应对 while True 主循环)。"""
+    if DEVICE_MODE == "persistent":
+        code = Path(path).read_text(encoding="utf-8")
+        return _SESSION.exec(code, timeout_s)
     try:
-        return _mpremote("run", path, timeout=timeout_s)
+        return _mpremote("run", path, timeout=timeout_s, script_timeout=True)
     except subprocess.TimeoutExpired as e:
         soft_reset()
         out = (e.stdout or b"")
@@ -156,28 +412,32 @@ def run_script(path: str, timeout_s: float = 20) -> str:
 def repl_exec(code: str, timeout_s: float = 20) -> str:
     """在板上执行一段 MicroPython 代码, 如 'import gc; print(gc.mem_free())'。
     也是软件触发播放的入口: 'import piano; piano.play()'。"""
+    if DEVICE_MODE == "persistent":
+        return _SESSION.exec(code, timeout_s)
     return _mpremote("exec", code, timeout=timeout_s)
 
 
 def device_ls() -> str:
     """列出板上文件系统。"""
+    if DEVICE_MODE == "persistent":
+        return _SESSION.exec("import os; print('\\n'.join(os.listdir()))")
     return _mpremote("fs", "ls")
 
 
 def device_rm(name: str) -> str:
     """删除板上文件(典型: 改 CACHE_VERSION 后清理陈旧音色缓存 .bin/.json)。"""
+    if DEVICE_MODE == "persistent":
+        return _SESSION.exec(f"import os; os.remove({name!r}); print('已删除 {name}')")
     return _mpremote("fs", "rm", ":" + name)
 
 
 def soft_reset() -> str:
-    """软复位: 打断死循环, 重新进入 REPL。"""
-    try:
-        return _mpremote("soft-reset", timeout=10)
-    except subprocess.TimeoutExpired:
-        return ("软复位超时。若板上 main.py 上电自动运行并抢占 REPL，恢复顺序："
-                "1) 确认无其他程序占用串口；2) 拔插 USB 后立即执行 repl_exec 或 "
-                "device_ls（mpremote 会在连接时发 Ctrl-C 抢在 main.py 前接管）；"
-                "3) 仍无效则 device_rm main.py 断掉自动运行。")
+    """软复位: 打断死循环, 重新进入 REPL。
+    注意: 超时归因见 _classify_silent_timeout——不要把超时归因于 main.py
+    抢占 REPL（Ctrl-C 可中断任何循环）。"""
+    if DEVICE_MODE == "persistent":
+        return _SESSION.soft_reset_device()
+    return _mpremote("soft-reset", timeout=10)
 
 
 # =============================================================================
@@ -412,8 +672,9 @@ def compare_audio(recorded: str, reference: str) -> str:
 # 入口: MCP 服务器 或 命令行
 # =============================================================================
 
-TOOL_FUNCS = [list_ports, get_port, set_port, upload, run_script, repl_exec,
-              device_ls, device_rm, soft_reset, mic_check, record_audio,
+TOOL_FUNCS = [list_ports, get_port, set_port, check_port, connect_device,
+              disconnect_device, upload, run_script, repl_exec, device_ls,
+              device_rm, soft_reset, mic_check, record_audio,
               play_and_record, analyze_wav, compare_audio]
 
 
