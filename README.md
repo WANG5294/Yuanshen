@@ -1,8 +1,8 @@
-# Yuanshen v1.0 正式版
+# Yuanshen v1.1.5
 
 面向 ESP32 MicroPython 的闭环开发 Agent。用户确认规范化需求与接线后，Agent 自动完成编写代码、烧录为板上 `main.py`、实机测试和结果汇报。
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://www.npmjs.com/package/yuanshen-esp32-agent)
+[![App Version](https://img.shields.io/badge/app-1.1.5-blue)](https://github.com/WANG5294/Yuanshen)
 [![License](https://img.shields.io/badge/license-MIT-green)](./package.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](./requirements.txt)
 [![npm](https://img.shields.io/npm/v/yuanshen-esp32-agent)](https://www.npmjs.com/package/yuanshen-esp32-agent)
@@ -25,11 +25,11 @@
 
 ## 简介
 
-Yuanshen 是一个运行在 Ubuntu/Linux 或 macOS 上的命令行 Agent，专用于 ESP32 单片机开发。它把"需求理解 → 代码生成 → 固件烧录 → 实机验证"串成闭环：
+Yuanshen 是一个可运行在 Windows、Ubuntu/Linux 或 macOS 上的命令行 Agent，专用于 ESP32 单片机开发。它把“需求理解 → 代码生成 → 文件部署 → 实机验证”串成闭环：
 
 1. **需求与接线规范化**：独立模型读取 ESP32 硬件参考手册、当前 `wiring.md` 和用户任务，生成可测试的需求与规范化接线，经用户确认后写入 `requirement.md` 并更新 `wiring.md`。
 2. **Agent 闭环执行**：主体模型在固定 System Prompt 下，按"编写代码 → 烧录代码 → 测试代码 → 完成"主线推进。
-3. **实机验证**：通过 MCP 工具连接串口，上传并执行板上 `main.py`；音频任务额外使用麦克风闭环验证。
+3. **可靠部署与实机验证**：通过 MCP 工具连接串口；文件先上传到临时路径，在 ESP32 端核对大小与 SHA-256 后再安全替换目标文件。上传 `main.py` 时保留失败回滚路径；音频任务额外使用麦克风闭环验证。
 4. **审计与沉淀**：每轮保存完整快照到 `project/<项目>/rounds/`，任务结束后可提取经验为 Skill。
 
 ---
@@ -41,6 +41,9 @@ Yuanshen 是一个运行在 Ubuntu/Linux 或 macOS 上的命令行 Agent，专�
 - **固定 Prompt 前缀**：System Prompt 在单任务内冻结，历史只追加、不回改，TodoList 固定在最末尾，尽可能复用公共前缀。
 - **四项主线 TodoList**：`编写代码`、`烧录代码`、`测试代码`、`完成`，不可改名、调序或插入子项。
 - **实机证据判定**：只有上传为板上 `main.py` 且明确执行 `main.py` 才算完成烧录与测试；代码修改会自动失效旧证据。
+- **跨平台串口连接**：兼容 Windows `COM*` 与 Linux `/dev/ttyACM*`、`/dev/ttyUSB*`；唯一 USB 串口可自动选择，多设备时要求明确指定。
+- **可校验安全上传**：临时文件写入后在 ESP32 端计算 SHA-256，校验通过才替换目标文件；设备异常和 Raw REPL 协议异常不会误报为 `OK`。
+- **连接自动释放**：程序退出时关闭 MCP 子进程及其持有的串口，减少 IDE、串口监视器或其他 Yuanshen 实例无法连接的问题。
 - **音频可降级验收**：`AUDIO_VALIDATION_MODE` 支持 `auto`（默认）/`required`/`off`，音频异常时不拖垮主任务。
 - **逐轮审计快照**：每轮模型调用后保存 System Prompt、工具定义、完整消息链、模型响应和 TodoList。
 - **Skill 知识库**：硬件手册拆分为 11 个主题 Skill，按需加载；历史经验经用户确认后沉淀为 `exp-*` Skill。
@@ -54,7 +57,9 @@ Yuanshen 是一个运行在 Ubuntu/Linux 或 macOS 上的命令行 Agent，专�
 
 ### 方式一：源码运行
 
-前置要求：系统已安装 `python3`（建议 3.10+）。
+前置要求：系统已安装 Python 3.10 或更新版本。
+
+#### Linux / macOS
 
 ```bash
 # 克隆仓库
@@ -73,6 +78,18 @@ cp .env.example .env
 .venv/bin/python yuanshen.py
 ```
 
+#### Windows PowerShell
+
+```powershell
+git clone https://github.com/WANG5294/Yuanshen.git
+Set-Location Yuanshen
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+# 编辑 .env 并填入对应模型的 API Key
+.\.venv\Scripts\python.exe .\yuanshen.py
+```
+
 ### 方式二：npm 全局安装
 
 ```bash
@@ -82,14 +99,23 @@ yuanshen
 
 首次运行会自动创建 `.venv` 并安装 Python 依赖。
 
-### 串口权限
+### 连接 ESP32
 
-串口访问需要当前用户在 `dialout` 组：
+默认 `ESP32_PORT=auto`。当系统中恰好存在一个 USB 串口时，长连接会自动选择它；存在多个候选设备时，请使用 `/port` 或 `.env` 明确指定，例如：
+
+```text
+ESP32_PORT=/dev/ttyACM0   # Linux
+ESP32_PORT=COM5           # Windows
+```
+
+Linux 串口访问通常需要当前用户在 `dialout` 组：
 
 ```bash
 sudo usermod -aG dialout $USER
 # 重新登录后生效
 ```
+
+连接前请关闭 Thonny、串口监视器、Pymakr、其他 `mpremote` 或 Yuanshen 实例。Linux 设备重新插拔后编号可能变化，应重新运行 `/work` 或 `/port` 枚举；Windows 请在设备管理器确认实际 `COM` 号。
 
 ---
 
@@ -109,11 +135,15 @@ MOONSHOT_API_KEY=你的Moonshot_Key
 
 # 音频验收模式
 AUDIO_VALIDATION_MODE=auto   # auto | required | off
+
+# ESP32 串口；单个 USB 串口可用 auto，多设备时明确指定
+ESP32_PORT=auto
 ```
 
 - `MODEL` 决定启动时默认使用的模型；不同模型需要对应 Key。
 - 运行中可通过 `/model` 选择或 `/api-key` 设置新 Key（自动保存到 `.env`）。
 - 运行中可通过 `/audio` 切换音频验收模式，仅当前会话生效。
+- 运行中可通过 `/port` 查看、枚举或切换 ESP32 串口。
 
 ---
 
@@ -130,6 +160,7 @@ AUDIO_VALIDATION_MODE=auto   # auto | required | off
 | `/model` | 查看并切换大模型（Tab 补全模型名） |
 | `/api-key` | 查看或更新当前模型的 API Key（自动保存到 .env） |
 | `/audio` | 交互切换音频验收模式 |
+| `/port` | 查看、枚举或切换 ESP32 串口 |
 | `/doc <md路径>` | 导入符合格式的硬件说明文档为 Skill |
 | `/new 项目名` | 创建新 ESP32 项目（项目文件保存在 project/ 下） |
 | `/history` | 浏览历史项目，输入编号查看详情 |
@@ -164,7 +195,7 @@ Yuanshen/
 │   ├── esp32-gpio-capabilities/
 │   ├── esp32-led-key-buzzer/
 │   └── ...
-├── yuanshen.py                  # Agent 主程序（~2300 行）
+├── yuanshen.py                  # Agent 主程序
 ├── esp32_piano_mcp.py           # MCP 服务器（设备通道 + 音频闭环）
 ├── wiring.md                    # 全局默认接线模板
 ├── requirements.txt             # Python 依赖
@@ -181,10 +212,10 @@ Yuanshen/
 
 ## 文档
 
-- [v1.0 架构](docs/architecture-v4.md)
+- [架构说明](docs/architecture-v4.md)
 - [Prompt 与缓存结构](docs/prompt-architecture-v4.md)
 - [用户指南](docs/user-guide.md)
-- [v1.0 全代码风险审查](docs/code-audit-v1.0.md)
+- [全代码风险审查](docs/code-audit-v1.0.md)
 - [ESP32 硬件参考手册](docs/reference/修正ESP32_D0WD_硬件开发手册.md)
 
 ---
@@ -196,6 +227,12 @@ Yuanshen/
 ```bash
 python3 -m py_compile yuanshen.py
 python3 -m py_compile esp32_piano_mcp.py
+```
+
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\python.exe -m py_compile .\yuanshen.py .\esp32_piano_mcp.py
 ```
 
 清理缓存：

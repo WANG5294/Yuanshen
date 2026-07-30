@@ -25,6 +25,7 @@ raw REPL 会话，MCP 进程常驻故跨工具调用存活；CLI 模式每次进
 依赖: mpremote, arecord(alsa-utils), numpy。分析全部用 numpy, 不需要 scipy。
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -57,7 +58,8 @@ class _ReplSession:
             设备回 'raw REPL; CTRL-B to exit\\r\\n>'；
       执行: 发送代码 + Ctrl-D，设备回 'OK' + stdout + \\x04 + stderr + \\x04 + '>'；
       复位: Ctrl-B 退出 raw 模式后 Ctrl-D 软复位。
-    打开串口前置 DTR/RTS=False，避免 Windows 下打开即触发板子复位。"""
+    Windows 打开串口前置 DTR/RTS=False，避免 CP210x 打开毛刺；Linux 保持
+    驱动默认值，避免 CH9102/CH340 被持续置于复位/下载状态。"""
 
     def __init__(self):
         self.ser = None
@@ -71,6 +73,11 @@ class _ReplSession:
             try:
                 if self.ser.is_open:
                     self.ser.write(b"\x02")      # Ctrl-B 退出 raw REPL
+                    if os.name == "nt":
+                        # 与 mpremote 的 Windows 关闭顺序一致，避免 CP210x
+                        # 在关闭端口时因控制线先后顺序触发意外复位。
+                        self.ser.rts = False
+                        self.ser.dtr = False
                     self.ser.close()
             except Exception:
                 pass
@@ -80,13 +87,13 @@ class _ReplSession:
 
     def _read_until(self, token: bytes, timeout: float) -> bytes:
         """读到 token 为止；token 之后的多余字节留在 _buf 供下次使用。"""
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
             if token in self._buf:
                 i = self._buf.index(token) + len(token)
                 out, self._buf = self._buf[:i], self._buf[i:]
                 return out
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
                 out, self._buf = self._buf, b""
                 return out
             chunk = self.ser.read(256)
@@ -95,10 +102,21 @@ class _ReplSession:
 
     def _open(self):
         import serial
+        global PORT
         if PORT == "auto":
-            raise RuntimeError(
-                "长连接模式需要先用 set_port 指定串口（如 COM5）；"
-                "auto 可能误选蓝牙等虚拟串口。")
+            from serial.tools import list_ports as serial_list_ports
+            candidates = [
+                p.device for p in serial_list_ports.comports()
+                if (os.name == "nt" and p.vid is not None)
+                or p.device.startswith(("/dev/ttyACM", "/dev/ttyUSB"))
+            ]
+            if len(candidates) != 1:
+                shown = ", ".join(candidates) or "无"
+                raise RuntimeError(
+                    "自动探测需要恰好一个 USB 串口，当前候选为："
+                    f"{shown}。请用 set_port 明确选择。"
+                )
+            PORT = candidates[0]
         if self.ser is not None and self.port == PORT and self.ser.is_open:
             return
         self.close()
@@ -107,15 +125,27 @@ class _ReplSession:
             s.port = PORT
             s.baudrate = 115200
             s.timeout = 0.1
-            s.dtr = False                # 关键：避免打开串口时复位开发板
-            s.rts = False
+            # Linux 下 CH9102/CH340 的 DTR/RTS 极性与 CP210x 不同，预先
+            # 强制 False 可能把 ESP32 持续按在复位/下载状态。仅保留原本
+            # 针对 Windows 打开端口毛刺的规避。
+            if os.name == "nt":
+                s.dtr = False
+                s.rts = False
             s.open()
+            if os.name == "nt":
+                # CP210x Windows 驱动首次打开时需先清零再按此顺序恢复，
+                # 以避免 DTR/RTS 不同时生效形成复位脉冲。
+                s.dtr = True
+                s.rts = True
         except Exception as e:
             raise RuntimeError(_classify_mpremote_error(str(e))) from None
         self.ser, self.port = s, PORT
         try:
             s.reset_input_buffer()
-            s.write(b"\r\x03\x03")       # Ctrl-C ×2，打断运行中的 main.py
+            # 上一个客户端若异常退出，设备可能仍停在 raw REPL。先 Ctrl-B
+            # 统一回 friendly REPL，再 Ctrl-C 打断 main.py；否则 raw 状态下
+            # 再发 Ctrl-A 不会重新输出 banner，容易被误判为无应答。
+            s.write(b"\r\x02\x03\x03")
             time.sleep(0.3)
             s.reset_input_buffer()
             s.write(b"\x01")             # Ctrl-A 进入 raw REPL
@@ -131,12 +161,8 @@ class _ReplSession:
             raise
 
     def _ensure(self):
-        """惰性连接；串口异常断开时重连一次。"""
-        try:
-            self._open()
-        except RuntimeError:
-            self.close()
-            self._open()
+        """惰性连接。失败原样上报，避免一次调用暗中重复握手。"""
+        self._open()
 
     # ---- 上层操作 ----
 
@@ -156,16 +182,30 @@ class _ReplSession:
                 body = (out + rest).replace(b"OK", b"", 1)
                 return ("(执行超时, 已 Ctrl-C 打断)\n"
                         + body.replace(b"\x04", b"").decode(errors="replace").strip())
+            if not out.startswith(b"OK"):
+                raise RuntimeError(
+                    "raw REPL 响应帧损坏或失步：缺少 OK 前缀；"
+                    f"响应={out[:120]!r}。"
+                )
             err = self._read_until(b"\x04", 2)
-            self._read_until(b">", 1)
-            stdout = out[2:out.rfind(b"\x04")] if out.startswith(b"OK") \
-                else out.replace(b"\x04", b"")
+            prompt = self._read_until(b">", 1)
+            if not err.endswith(b"\x04") or not prompt.endswith(b">"):
+                raise RuntimeError(
+                    "raw REPL 响应帧不完整（缺少 stderr EOT 或提示符）"
+                )
+            stdout = out[2:-1]
             stderr = err.replace(b"\x04", b"")
             text = stdout.decode(errors="replace").strip()
             if stderr.strip():
-                text += ("\n" if text else "") + stderr.decode(errors="replace").strip()
+                detail = stderr.decode(errors="replace").strip()
+                raise RuntimeError(
+                    "ESP32 执行代码失败："
+                    + (f"\nstdout:\n{text}" if text else "")
+                    + f"\nstderr:\n{detail}"
+                )
             return text or "OK"
         except RuntimeError:
+            self.close()
             raise
         except Exception as e:            # 串口掉线等：重连一次再报错
             self.close()
@@ -197,14 +237,72 @@ class _ReplSession:
     def upload(self, local_path: str, remote_name: str = "") -> str:
         data = Path(local_path).read_bytes()
         dest = remote_name or Path(local_path).name
-        self.exec(f"f=open({dest!r},'wb')")
+        temp = "." + dest + ".uploading"
+        backup = "." + dest + ".backup"
+        expected_sha256 = hashlib.sha256(data).hexdigest()
+        self.exec(f"f=open({temp!r},'wb')")
         try:
             for i in range(0, len(data), 512):
-                self.exec(f"f.write(bytes.fromhex('{data[i:i+512].hex()}'))",
+                # MicroPython 的 bytes 没有 CPython 的 fromhex()。
+                self.exec(
+                    "f.write(__import__('ubinascii').unhexlify("
+                    f"'{data[i:i+512].hex()}'))",
                           timeout_s=30)
         finally:
             self.exec("f.close()")
-        return f"已上传 {local_path} -> :{dest}（{len(data)} 字节，长连接写入）"
+        verify_code = (
+            "import os\n"
+            f"_p={temp!r}\n"
+            "_f=open(_p,'rb'); _n=0\n"
+            "_h=__import__('uhashlib').sha256()\n"
+            "while True:\n"
+            " b=_f.read(512)\n"
+            " if not b: break\n"
+            " _n+=len(b); _h.update(b)\n"
+            "_f.close()\n"
+            "_hex=__import__('ubinascii').hexlify(_h.digest()).decode()\n"
+            "print(str(_n)+' '+_hex)"
+        )
+        remote = self.exec(verify_code, timeout_s=30).strip().splitlines()[-1]
+        expected = f"{len(data)} {expected_sha256}"
+        if remote != expected:
+            try:
+                self.exec(f"import os; os.remove({temp!r})")
+            except RuntimeError:
+                pass
+            raise RuntimeError(
+                f"上传校验失败：设备返回 {remote!r}，期望 {expected!r}；"
+                f"原 {dest} 未替换。"
+            )
+        commit_code = (
+            "import os\n"
+            f"_dst={dest!r}; _tmp={temp!r}; _bak={backup!r}\n"
+            "try:\n os.remove(_bak)\n"
+            "except OSError:\n pass\n"
+            "_had=False\n"
+            "try:\n os.rename(_dst,_bak); _had=True\n"
+            "except OSError:\n pass\n"
+            "try:\n os.rename(_tmp,_dst)\n"
+            "except Exception:\n"
+            " if _had: os.rename(_bak,_dst)\n"
+            " raise\n"
+            "if _had: os.remove(_bak)\n"
+            "print('COMMIT_OK')"
+        )
+        committed = self.exec(commit_code, timeout_s=30)
+        if committed.strip() != "COMMIT_OK":
+            raise RuntimeError(f"设备未确认文件替换：{committed!r}")
+        final_size = self.exec(
+            f"import os; print(os.stat({dest!r})[6])", timeout_s=10
+        ).strip()
+        if final_size != str(len(data)):
+            raise RuntimeError(
+                f"替换后大小复核失败：设备为 {final_size!r}，期望 {len(data)}"
+            )
+        return (
+            f"已原子上传并校验 {local_path} -> :{dest}"
+            f"（{len(data)} 字节，SHA-256 {expected_sha256[:12]}…）"
+        )
 
 
 _SESSION = _ReplSession()

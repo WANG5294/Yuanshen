@@ -35,6 +35,7 @@ v4.0 将模型输入重构为“固定 System Prompt → 追加式 User/会话�
                              .env 优先本目录）
 """
 
+import atexit
 import json
 import hashlib
 import os
@@ -792,9 +793,31 @@ class MCPClient:
             return f"Error: {text}"
         return text or "(无输出)"
 
+    def close(self):
+        """结束 MCP 子进程，从而释放其持有的持久串口。"""
+        if self.proc.poll() is not None:
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=3)
+
 
 MCP_CLIENTS = {}
 MCP_TOOL_DEFS = []
+
+
+def close_mcp_clients():
+    for client in set(MCP_CLIENTS.values()):
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+atexit.register(close_mcp_clients)
 
 
 def init_mcp():
