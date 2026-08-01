@@ -11,3 +11,4 @@ backups/
 .DS_Store
 project/*
 !project/.gitkeep
+!project/test_a2a_client.py
