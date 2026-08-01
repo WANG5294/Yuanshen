@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.npmignore
+.history
+.yuanshen/
+project/
+kimi.md
+prompt/
+main.py

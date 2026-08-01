@@ -53,7 +53,7 @@ ESP32_REFERENCE_FILE = (
 )
 CURRENT_TASK_DIR = None                 # 当前任务的项目文件夹（main 里逐任务设置）
 MAX_ITERATIONS = 100
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 AUDIO_VALIDATION_MODE = os.getenv("AUDIO_VALIDATION_MODE", "auto").strip().lower()
 if AUDIO_VALIDATION_MODE not in ("auto", "required", "off"):
     AUDIO_VALIDATION_MODE = "auto"
