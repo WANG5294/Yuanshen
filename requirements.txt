@@ -6,3 +6,5 @@ mpremote>=1.20
 prompt-toolkit>=3.0
 openai>=1.0
 rich>=13.0
+a2a-sdk>=0.3,<1.0
+uvicorn>=0.30

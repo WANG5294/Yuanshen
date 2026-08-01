@@ -2377,7 +2377,86 @@ BANNER_ART = r"""
 """
 
 
+def execute_project_task(requirement: str, audio_required: bool,
+                         project_dir: Path, content: str = None) -> dict:
+    """以已确认的规范化需求跑完整 Agent 闭环并归档，返回 run_log。
+
+    requirement    用户确认后的规范化需求（写 requirement.md、作为 TODO 目标）
+    audio_required 是否需要音频闭环验收
+    project_dir    项目目录（缺 wiring.md/rounds/ 时自动补齐）
+    content        首轮 user prompt 输入；默认等于 requirement，
+                   需要附带经验上下文时由调用方合成
+    run_log["pending_skill_context"] 非空表示用户选择带上下文继续对话
+    """
+    task_start = time.monotonic()
+    content = content or requirement
+    TODO.start(requirement, audio_required)
+    global CURRENT_TASK_DIR
+    CURRENT_TASK_DIR = project_dir
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "rounds").mkdir(exist_ok=True)
+    if not (project_dir / "wiring.md").exists():
+        if WIRING_FILE.exists():
+            shutil.copy2(WIRING_FILE, project_dir / "wiring.md")
+        else:
+            (project_dir / "wiring.md").write_text("（无接线）\n")
+    write_requirement(project_dir, requirement)
+    messages = [{
+        "role": "user",
+        "content": build_user_prompt(
+            content, round_no=1, elapsed=0,
+            previous_result="任务开始", previous_tools="无",
+        ),
+    }]
+    console.print(f"[dim][项目实施][/dim] {_display_path(project_dir)}")
+    run_log = {"rounds": [], "prompt_input": content}
+    try:
+        agent_loop(messages, run_log, task_start)
+    except Exception as e:
+        console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
+        run_log.setdefault("final_text", f"(异常中止: {e})")
+    console.print("\n[dim]⏳ 正在保存最终代码与完整 user prompt，并提取经验…[/dim]")
+    pending = None
+    try:
+        flow_md = render_flow_md(requirement, run_log)
+        run_dir = archive_run(
+            requirement, project_dir, messages,
+            run_log.get("system_prompt", ""),
+        )
+        note, pending = extract_skill(flow_md, run_dir)
+        console.print(f"[归档] {_display_path(run_dir)} | {note}")
+        console.print("✅ [green]最终代码与完整 user prompt 已保存，可以继续提问或退出。[/green]")
+    except Exception as e:
+        console.print(f"[red][归档失败][/red] {e}")
+    run_log["pending_skill_context"] = pending
+    return run_log
+
+
+def run_a2a_mode():
+    """A2A 服务端模式：不启动 REPL，终端仅用于远程任务的人工确认。"""
+    def _arg(flag: str):
+        if flag in sys.argv and sys.argv.index(flag) + 1 < len(sys.argv):
+            return sys.argv[sys.argv.index(flag) + 1]
+        return None
+
+    host = _arg("--a2a-host") or os.getenv("A2A_HOST", "127.0.0.1")
+    port = int(_arg("--a2a-port") or os.getenv("A2A_PORT", "9999"))
+    try:
+        import a2a_server
+    except ImportError as e:
+        console.print(f"[red]缺少 A2A 依赖: {e}[/red]")
+        console.print("请安装: [yellow]pip install 'a2a-sdk>=0.3,<1.0' "
+                      "'uvicorn>=0.30'[/yellow]（或重新 pip install -r requirements.txt）")
+        sys.exit(1)
+    # 初始化在 a2a_server 内对其 import 的 yuanshen 模块完成——
+    # 远程任务全部经由该模块状态运行,在 __main__ 里初始化无效
+    a2a_server.bootstrap(host, port)
+
+
 def main():
+    if "--a2a" in sys.argv:
+        run_a2a_mode()
+        return
     has_key_loaded = load_api_key()
     init_mcp()
     
@@ -2460,7 +2539,6 @@ def main():
             if confirmed is None:
                 print()
                 continue
-            task_start = time.monotonic()
             normalized_requirement, _normalized_wiring, audio_required = confirmed
 
             content = normalized_requirement
@@ -2468,38 +2546,12 @@ def main():
                 content = (f"{pending_context}\n\n"
                            f"【用户确认后的本轮规范化需求】{normalized_requirement}")
                 pending_context = None
-            TODO.start(normalized_requirement, audio_required)
-            global CURRENT_TASK_DIR
-            CURRENT_TASK_DIR = current_project_dir
-            write_requirement(CURRENT_TASK_DIR, normalized_requirement)
-            messages = [{
-                "role": "user",
-                "content": build_user_prompt(
-                    content, round_no=1, elapsed=0,
-                    previous_result="任务开始", previous_tools="无",
-                ),
-            }]
-            console.print(f"[dim][项目实施][/dim] {_display_path(CURRENT_TASK_DIR)}")
-            run_log = {"rounds": [], "prompt_input": content}
-            try:
-                agent_loop(messages, run_log, task_start)
-            except Exception as e:
-                console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
-                run_log.setdefault("final_text", f"(异常中止: {e})")
-            console.print("\n[dim]⏳ 正在保存最终代码与完整 user prompt，并提取经验…[/dim]")
-            try:
-                flow_md = render_flow_md(normalized_requirement, run_log)
-                run_dir = archive_run(
-                    normalized_requirement, CURRENT_TASK_DIR, messages,
-                    run_log.get("system_prompt", ""),
-                )
-                note, pending = extract_skill(flow_md, run_dir)
-                if pending:
-                    pending_context = pending
-                console.print(f"[归档] {_display_path(run_dir)} | {note}")
-                console.print("✅ [green]最终代码与完整 user prompt 已保存，可以继续提问或退出。[/green]")
-            except Exception as e:
-                console.print(f"[red][归档失败][/red] {e}")
+            run_log = execute_project_task(
+                normalized_requirement, audio_required,
+                current_project_dir, content,
+            )
+            if run_log.get("pending_skill_context"):
+                pending_context = run_log["pending_skill_context"]
             console.print("\n" + "━" * 50, style="orange1")
             print()
         else:
