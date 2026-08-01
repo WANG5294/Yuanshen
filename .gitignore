@@ -12,3 +12,5 @@ backups/
 project/*
 !project/.gitkeep
 !project/test_a2a_client.py
+.kimi-code/
+.tmp_remote/
