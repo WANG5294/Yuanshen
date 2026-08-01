@@ -1,8 +1,8 @@
-# Yuanshen v1.2.0
+# Yuanshen v1.2.1
 
 面向 ESP32 MicroPython 的闭环开发 Agent。用户确认规范化需求与接线后，Agent 自动完成编写代码、烧录为板上 `main.py`、实机测试和结果汇报。
 
-[![Version](https://img.shields.io/badge/version-1.2.0-blue)](https://www.npmjs.com/package/yuanshen-esp32-agent)
+[![Version](https://img.shields.io/badge/version-1.2.1-blue)](https://www.npmjs.com/package/yuanshen-esp32-agent)
 [![License](https://img.shields.io/badge/license-MIT-green)](./package.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](./requirements.txt)
 [![npm](https://img.shields.io/npm/v/yuanshen-esp32-agent)](https://www.npmjs.com/package/yuanshen-esp32-agent)
@@ -36,7 +36,7 @@ Yuanshen 是一个跨平台命令行 Agent（Windows 物理机 / Linux（含虚�
 
 ## 核心特性
 
-- **现代化终端 UI**：ASCII art 启动画面、Rich 彩色面板/表格、打字机效果输出、橙色分隔线、对话颜色区分。
+- **现代化终端 UI**：ASCII art 启动画面、Rich 彩色面板/表格、**真正的 token 级流式输出**（模型回复像打字一样逐字出现，工具轮思考块保留回传）、需求确认页左右分栏+变更高亮、主线进度条、轮次结果卡片、最终报告模板、`/work` 健康仪表盘（含修复建议）、`/help` 分组命令菜单。
 - **规范化门禁**：任务执行前必须用户确认需求和接线，原始提示词不会直接进入 Agent 循环。
 - **固定 Prompt 前缀**：System Prompt 在单任务内冻结，历史只追加、不回改，TodoList 固定在最末尾，尽可能复用公共前缀。
 - **四项主线 TodoList**：`编写代码`、`烧录代码`、`测试代码`、`完成`，不可改名、调序或插入子项。
@@ -68,12 +68,12 @@ cd Yuanshen
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 配置 API Key
-cp .env.example .env
-# 编辑 .env 填入你的 API Key
-
-# 启动
+# 启动（首次运行会自动创建 ~/.yuanshen/.env 并复制配置模板）
 .venv/bin/python yuanshen.py
+
+# 配置 API Key（二选一）：
+#   方式一：编辑 ~/.yuanshen/.env 填入 Key 后重启
+#   方式二：启动后在程序内运行 /api-key 命令
 ```
 
 ### 方式二：npm 全局安装
@@ -103,7 +103,7 @@ yuanshen
 
 ## 配置
 
-在项目根目录创建 `.env`（可复制 `.env.example`，或使用 `/api-key` 命令在程序内设置）：
+配置文件位于 `~/.yuanshen/.env`（用户数据目录）。首次运行程序会自动从 `.env.example` 创建模板；也可以直接在程序内用 `/api-key` 命令设置。项目根目录的 `.env` 仍兼容（旧版升级），优先级为 `~/.yuanshen/.env` 优先。
 
 ```text
 # 默认模型：deepseek-v4-pro | deepseek-v4-flash | kimi-k3 | kimi-k2.7
@@ -222,7 +222,20 @@ Yuanshen/
 │   ├── esp32-gpio-capabilities/
 │   ├── esp32-led-key-buzzer/
 │   └── ...
-├── yuanshen.py                  # Agent 主程序（~2500 行）
+├── yuanshen.py                  # 入口：命令分发与主 REPL
+├── main.py                      # REPL 连通性检查脚本（ESP32 板上程序）
+├── yuanshen/                    # 核心包
+│   ├── __init__.py              # 兼容导出（供 a2a_server 等导入）
+│   ├── config.py                # 配置、全局状态、路径常量
+│   ├── models.py                # 大模型客户端与 API Key 管理
+│   ├── mcp_client.py            # MCP 最小客户端
+│   ├── skills.py                # Skill 知识库
+│   ├── todos.py                 # 主线任务状态机
+│   ├── prompts.py               # System/User Prompt 构建与归档渲染
+│   ├── tools.py                 # 本地工具与 MCP 工具路由
+│   ├── ui.py                    # Rich 终端 UI 渲染与输入
+│   ├── agent.py                 # 需求规范化、Agent 循环、归档、经验提取
+│   └── utils.py                 # 小型共享工具函数
 ├── a2a_server.py                # A2A 服务端（Agent Card + 远程任务桥接）
 ├── a2a_client_mcp.py            # A2A 客户端 MCP 桥（供 Kimi Code 等委派任务）
 ├── esp32_piano_mcp.py           # MCP 服务器（长连接设备通道 + 音频闭环）
@@ -267,8 +280,7 @@ Yuanshen/
 本地语法检查：
 
 ```bash
-python3 -m py_compile yuanshen.py
-python3 -m py_compile esp32_piano_mcp.py
+python3 -m py_compile yuanshen.py yuanshen/*.py a2a_server.py esp32_piano_mcp.py
 ```
 
 清理缓存：

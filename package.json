@@ -1,6 +1,6 @@
 {
   "name": "yuanshen-esp32-agent",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Yuanshen — ESP32 MicroPython 闭环开发 Agent，带现代化终端 UI",
   "bin": {
     "yuanshen": "bin/yuanshen.js"
@@ -8,6 +8,7 @@
   "files": [
     "bin/",
     "yuanshen.py",
+    "yuanshen/",
     "a2a_server.py",
     "a2a_client_mcp.py",
     "esp32_piano_mcp.py",
