@@ -25,11 +25,11 @@
 
 ## 简介
 
-Yuanshen 是一个跨平台命令行 Agent（Windows 物理机 / Linux（含虚拟机）/ macOS，运行环境由程序自动探测并注入 System Prompt），专用于 ESP32 单片机开发。它把"需求理解 → 代码生成 → 固件烧录 → 实机验证"串成闭环：
+Yuanshen 是一个跨平台命令行 Agent（Windows 物理机 / Linux（含虚拟机）/ macOS，运行环境由程序自动探测并注入 System Prompt），专用于 ESP32 单片机开发。它把"需求理解 → 代码生成 → 文件部署 → 实机验证"串成闭环：
 
 1. **需求与接线规范化**：独立模型读取 ESP32 硬件参考手册、当前 `wiring.md` 和用户任务，生成可测试的需求与规范化接线，经用户确认后写入 `requirement.md` 并更新 `wiring.md`。
 2. **Agent 闭环执行**：主体模型在固定 System Prompt 下，按"编写代码 → 烧录代码 → 测试代码 → 完成"主线推进。
-3. **实机验证**：通过 MCP 工具连接串口，上传并执行板上 `main.py`；音频任务额外使用麦克风闭环验证。
+3. **可靠部署与实机验证**：通过 MCP 工具连接串口；文件先上传到临时路径，在 ESP32 端核对大小与 SHA-256 后再安全替换目标文件，上传 `main.py` 时保留失败回滚路径；音频任务额外使用麦克风闭环验证。
 4. **审计与沉淀**：每轮保存完整快照到 `~/.yuanshen/projects/<项目>/rounds/`，任务结束后可提取经验为 Skill。
 
 ---
@@ -43,6 +43,8 @@ Yuanshen 是一个跨平台命令行 Agent（Windows 物理机 / Linux（含虚�
 - **实机证据判定**：只有上传为板上 `main.py` 且明确执行 `main.py` 才算完成烧录与测试；代码修改会自动失效旧证据。
 - **长连接设备通道**：默认通过 pyserial 持久 raw REPL 会话操作开发板（单次执行 ~0.1s，任务期间独占串口、避免被其他程序抢占）；`ESP32_DEVICE_MODE=mpremote` 可回退为每次调用起 mpremote 子进程。
 - **串口故障自诊断**：`check_port` 主动探测占用，静默超时自动分类为"已打开但 REPL 无应答"（WCH CH9102/CH340 驱动不强制独占的典型症状），不再误诊为板上死循环。
+- **可校验安全上传**：临时文件写入后在 ESP32 端计算 SHA-256，校验通过才替换目标文件；设备异常和 Raw REPL 协议异常不会误报为 `OK`。
+- **连接自动释放**：程序退出时关闭 MCP 子进程及其持有的串口，减少 IDE、串口监视器或其他 Yuanshen 实例无法连接的问题。
 - **音频可降级验收**：`AUDIO_VALIDATION_MODE` 支持 `auto`（默认）/`required`/`off`，音频异常时不拖垮主任务。
 - **逐轮审计快照**：每轮模型调用后保存 System Prompt、工具定义、完整消息链、模型响应和 TodoList。
 - **Skill 知识库**：硬件手册拆分为 11 个主题 Skill，按需加载；历史经验经用户确认后沉淀为 `exp-*` Skill。
@@ -57,7 +59,9 @@ Yuanshen 是一个跨平台命令行 Agent（Windows 物理机 / Linux（含虚�
 
 ### 方式一：源码运行
 
-前置要求：系统已安装 `python3`（建议 3.10+）。
+前置要求：系统已安装 Python 3.10 或更新版本。
+
+#### Linux / macOS
 
 ```bash
 # 克隆仓库
@@ -76,6 +80,18 @@ python3 -m venv .venv
 #   方式二：启动后在程序内运行 /api-key 命令
 ```
 
+#### Windows PowerShell
+
+```powershell
+git clone https://github.com/WANG5294/Yuanshen.git
+Set-Location Yuanshen
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+# 编辑 .env 并填入对应模型的 API Key
+.\.venv\Scripts\python.exe .\yuanshen.py
+```
+
 ### 方式二：npm 全局安装
 
 ```bash
@@ -85,7 +101,14 @@ yuanshen
 
 首次运行会自动创建 `.venv` 并安装 Python 依赖。
 
-### 串口权限
+### 连接 ESP32
+
+默认 `ESP32_PORT=auto`：当系统中恰好存在一个 USB 串口时会自动选择它；存在多个候选设备时，请使用 `/port` 或 `.env` 明确指定，例如：
+
+```text
+ESP32_PORT=/dev/ttyACM0   # Linux
+ESP32_PORT=COM5           # Windows
+```
 
 - **Linux**：串口访问需要当前用户在 `dialout` 组；虚拟机运行还需把 USB 串口透传进虚拟机。
 
@@ -98,6 +121,8 @@ yuanshen
   使用前请关闭 Pymakr、串口监视器、Thonny 等占用方；WCH 芯片（CH9102/CH340）驱动
   不强制独占，被占用时表现为"能打开但无应答"的静默超时。
 - **macOS**：串口为 `/dev/cu.usbserial-*`。
+
+连接前请关闭 Thonny、串口监视器、Pymakr、其他 `mpremote` 或 Yuanshen 实例。Linux 设备重新插拔后编号可能变化，应重新运行 `/work` 或 `/port` 枚举；Windows 请在设备管理器确认实际 `COM` 号。
 
 ---
 
@@ -118,8 +143,8 @@ MOONSHOT_API_KEY=你的Moonshot_Key
 # 音频验收模式
 AUDIO_VALIDATION_MODE=auto   # auto | required | off
 
-# 串口（可选）：固定连接 ESP32 的串口，避免 auto 误选蓝牙等虚拟串口
-ESP32_PORT=COM5              # Windows: COM5 等；Linux: /dev/ttyUSB0 等
+# 串口（可选）：auto 时自动选择唯一 USB 串口；固定端口可避免误选蓝牙等虚拟串口
+ESP32_PORT=auto             # Windows: COM5 等；Linux: /dev/ttyUSB0 等
 
 # 设备通道模式（可选）：persistent 长连接（默认）| mpremote 短连接回退
 ESP32_DEVICE_MODE=persistent
@@ -133,7 +158,7 @@ A2A_PORT=9999
 - `MODEL` 决定启动时默认使用的模型；不同模型需要对应 Key。
 - 运行中可通过 `/model` 选择或 `/api-key` 设置新 Key（自动保存到 `.env`）。
 - 运行中可通过 `/audio` 切换音频验收模式，仅当前会话生效。
-- 运行中可通过 `/port` 查看/切换串口（热切换，自动释放旧长连接）。
+- 运行中可通过 `/port` 查看、枚举或切换串口（热切换，自动释放旧长连接）。
 
 ---
 
@@ -150,8 +175,8 @@ A2A_PORT=9999
 | `/model` | 查看并切换大模型（Tab 补全模型名） |
 | `/api-key` | 查看或更新当前模型的 API Key（自动保存到 .env） |
 | `/audio` | 交互切换音频验收模式 |
+| `/port` | 查看、枚举或切换 ESP32 串口 |
 | `/doc <md路径>` | 导入符合格式的硬件说明文档为 Skill |
-| `/port` | 查看/切换连接 ESP32 的串口 |
 | `/new 项目名` | 创建新 ESP32 项目（项目文件保存在 `~/.yuanshen/projects/` 下） |
 | `/history` | 浏览历史项目，输入编号查看详情 |
 | `/exit` | 退出程序 |
@@ -267,10 +292,10 @@ Yuanshen/
 
 ## 文档
 
-- [v1.0 架构](docs/architecture-v4.md)
+- [架构说明](docs/architecture-v4.md)
 - [Prompt 与缓存结构](docs/prompt-architecture-v4.md)
 - [用户指南](docs/user-guide.md)
-- [v1.0 全代码风险审查](docs/code-audit-v1.0.md)
+- [全代码风险审查](docs/code-audit-v1.0.md)
 - [ESP32 硬件参考手册](docs/reference/修正ESP32_D0WD_硬件开发手册.md)
 
 ---
@@ -281,6 +306,12 @@ Yuanshen/
 
 ```bash
 python3 -m py_compile yuanshen.py yuanshen/*.py a2a_server.py esp32_piano_mcp.py
+```
+
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\python.exe -m py_compile .\yuanshen.py .\esp32_piano_mcp.py
 ```
 
 清理缓存：
